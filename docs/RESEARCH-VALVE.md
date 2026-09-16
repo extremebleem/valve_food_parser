@@ -55,6 +55,25 @@ CS2 exposes more public state than any other Valve title.
 `ISteamWebAPIUtil/GetSupportedAPIList` lists **27** interfaces reachable without
 a key; the ones above are everything in it relevant to this project.
 
+## Round 3 — SteamPipe and Steamworks (2026-09-17)
+
+The premise being tested: when Valve rolls an update out, the plumbing feels
+it before anyone posts about it.
+
+| Signal | Endpoint | Result |
+| --- | --- | --- |
+| **Content delivery load** | `GetServersForSteamPipe?cell_id=0` | ✅ partner CDNs (fastly, alibaba, edgenext) report `load: 0`, but Valve's own `cache1-sto2`…`cache6-sto2` reported **77-80**. A real utilisation number, and everyone downloading at once is what a rollout looks like |
+| **Content delivery host set** | same | ✅ 10 hosts; adding or dropping a CDN partner is infrastructure news |
+| **Delivery domains** | `ISteamDirectory/GetSteamPipeDomains` | ✅ 28 domains |
+| **Client update hosts** | `GetClientUpdateHosts` | ✅ ~1 KB KV blob, 5 hosts, hashable |
+| Depot manifests via SteamPipe | `GetDepotPatchInfo`, direct CDN paths | ❌ **conclusively not available**: the endpoint returns `{"response":{}}` even when given `source_manifestid` and `target_manifestid`, and CDN paths need a manifest id that only PICS `app_info` provides. SteamPipe answers "where is content served from", never "which build is there" |
+| Steamworks docs | `partner.steamgames.com/doc/*` | ⚠️ readable without login (~120 KB HTML), but diffing SPA markup for new sections is noise with no defensible payoff |
+| Steamworks SDK downloads | `partner.steamgames.com/downloads/list` | ❌ page renders without login but carries **no version strings**; the real list is behind partner auth |
+| Whole app catalogue | `ISteamApps/GetAppList` | ❌ 404 on v1/v2/v0002. `IStoreService/GetAppList` needs the key, and with no publisher filter, attributing new appids to Valve would mean an `appdetails` call per appid against hundreds registered daily |
+| **Per-game DLC list** | `store/api/appdetails?appids=730` | ✅ the workable version of the above: CS2 lists `dlc: [2678630]`, one request, and a new entry means a new Valve product registered |
+| CS2 achievements | `GetGlobalAchievementPercentagesForApp` | ❌ returns exactly **1** achievement; "new achievement = new content" does not work |
+| `ValveSoftware/steam-runtime` releases | GitHub | ❌ zero releases — it uses dated tags (`v0.20260818.0`) instead |
+
 ## Consequence for the design
 
 Two different mechanisms, not one:

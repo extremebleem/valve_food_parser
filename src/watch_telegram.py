@@ -31,6 +31,9 @@ KEY_TITLES = {
     "gc_active_version": "🧩 Версия game coordinator изменилась",
     "latest_release": "🏷 Новый релиз",
     "latest_news": "📰 Официальный пост",
+    "steampipe_hosts": "📦 Изменился состав узлов раздачи",
+    "steampipe_domains": "📦 Изменились домены раздачи",
+    "client_update_hosts": "⬇️ Изменились хосты обновления клиента",
 }
 
 #: Ordered by how much warning the signal gives. A deploy in flight and a
@@ -46,8 +49,11 @@ PRIORITY = {
     "cs2_app_version": 6,
     "required_version": 7,
     "gc_active_version": 8,
-    "latest_release": 9,
-    "latest_news": 10,
+    "client_update_hosts": 9,
+    "steampipe_hosts": 10,
+    "steampipe_domains": 11,
+    "latest_release": 12,
+    "latest_news": 13,
 }
 
 
@@ -96,6 +102,23 @@ class WatchNotifier:
         if event.key == "cs2_services":
             return "🛠 Сервисы CS2 сменили состояние"
         return KEY_TITLES.get(event.key, "🔔 Изменение")
+
+    @staticmethod
+    def health_signal_count(
+        events: Sequence[WatchEvent], delta_hits: Sequence[Dict[str, Any]]
+    ) -> int:
+        """How many plumbing-under-strain signals moved in this run.
+
+        Each one alone has an innocent explanation -- matchmaking wobbles,
+        caches get busy, a counter dips. Several at once is the shape of a
+        rollout. The message reports the count and stops there; it does not
+        claim to know what is being rolled out.
+        """
+        from .watcher import HEALTH_KEYS
+
+        keys = {e.key for e in events if e.key in HEALTH_KEYS}
+        keys |= {h.get("key") for h in delta_hits if h.get("key") in HEALTH_KEYS}
+        return len(keys)
 
     @staticmethod
     def parse_services(text: str) -> Dict[str, str]:
@@ -165,6 +188,15 @@ class WatchNotifier:
             ),
             "",
         ]
+
+        strained = self.health_signal_count(ordered, delta_hits)
+        if strained >= 2:
+            parts.append(
+                "⚠️ <b>Сразу {} признака инфраструктурного напряжения</b> — "
+                "так обычно выглядит выкатка".format(strained)
+            )
+            parts.append("")
+
         for event in ordered:
             parts.extend(self.render_event(event))
             parts.append("")

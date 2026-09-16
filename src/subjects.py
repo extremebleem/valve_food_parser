@@ -24,11 +24,17 @@ class SubjectKind:
     STEAM_APP = "steam_app"        # a game/tool: watch its required version
     STEAM_FEED = "steam_feed"      # a news feed: watch the newest post
     GITHUB_REPO = "github_repo"    # a repository: watch tags and commit rate
+    STEAM_INFRA = "steam_infra"    # Steam's plumbing: content delivery, update hosts
 
 
 #: How much warning a signal typically gives. Used only to sort and label
 #: notifications -- it is a documented editorial judgement, not a measurement.
 LEAD_TIME = {
+    "steampipe_hosts": "дни",
+    "steampipe_domains": "дни",
+    "client_update_hosts": "часы–дни",
+    "steampipe_load_max": "минуты — идёт массовая загрузка",
+    "cs2_search_seconds_avg": "минуты — матчмейкингу тяжело",
     "latest_prerelease": "дни–недели",
     "sdr_pops": "дни–недели",
     "sdr_revision": "часы–дни",
@@ -82,6 +88,17 @@ class Subject:
             external_id=str(appid),
             name=name,
             url="https://store.steampowered.com/news/app/{}".format(appid),
+            **kw,
+        )
+
+    @classmethod
+    def steam_infra(cls, name: str, **kw: Any) -> "Subject":
+        return cls(
+            id=make_subject_id(SubjectKind.STEAM_INFRA, "steampipe"),
+            kind=SubjectKind.STEAM_INFRA,
+            external_id="steampipe",
+            name=name,
+            url="https://store.steampowered.com/",
             **kw,
         )
 
@@ -193,6 +210,9 @@ DEFAULT_SUBJECTS: List[Subject] = [
     Subject.steam_feed(730, "Counter-Strike 2 news", priority=15),
     Subject.steam_feed(570, "Dota 2 news", priority=15),
     Subject.steam_feed(1422450, "Deadlock news", priority=15),
+    # --- Steam plumbing: an update is felt here before it is announced -----
+    Subject.steam_infra("Инфраструктура Steam", priority=8),
+
     # --- repositories: tags and commit bursts precede releases --------------
     Subject.github_repo("ValveSoftware/Proton", priority=30),
     Subject.github_repo("ValveSoftware/gamescope", priority=30),

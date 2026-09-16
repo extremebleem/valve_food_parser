@@ -41,6 +41,9 @@ CHANGE_KEYS = frozenset(
         "cs2_app_version",
         "cs2_scheduler",
         "cs2_services",
+        "steampipe_hosts",
+        "steampipe_domains",
+        "client_update_hosts",
     }
 )
 
@@ -49,7 +52,42 @@ CHANGE_KEYS = frozenset(
 #: cycle, so every night would read as a collapse. A large relative jump
 #: against the previous reading has no such problem, and is exactly what a
 #: server restart looks like.
-DELTA_KEYS = frozenset({"players_current", "cs2_online_players", "cs2_online_servers"})
+DELTA_KEYS = frozenset(
+    {
+        "players_current",
+        "cs2_online_players",
+        "cs2_online_servers",
+        "cs2_search_seconds_avg",
+        "steampipe_load_max",
+    }
+)
+
+#: Per-key (minimum relative move, minimum absolute value) for DELTA_KEYS. One
+#: global threshold cannot serve both a million-player counter and a
+#: forty-second search time: 15% of 40 seconds is six seconds, which is noise,
+#: while 15% of a million players is not. Anything not listed falls back to the
+#: configured defaults.
+DELTA_RULES = {
+    "players_current": (0.15, 5_000.0),
+    "cs2_online_players": (0.15, 5_000.0),
+    "cs2_online_servers": (0.15, 100.0),
+    "cs2_search_seconds_avg": (0.40, 10.0),
+    "steampipe_load_max": (0.20, 20.0),
+}
+
+#: Signals that describe Valve's plumbing being under strain. Individually each
+#: has an innocent explanation; several moving in one run is the shape of a
+#: rollout, and the notification says so without claiming more than that.
+HEALTH_KEYS = frozenset(
+    {
+        "cs2_scheduler",
+        "cs2_services",
+        "cs2_search_seconds_avg",
+        "cs2_online_servers",
+        "cs2_online_players",
+        "steampipe_load_max",
+    }
+)
 
 
 class WatchStats:
@@ -193,6 +231,9 @@ class Watcher:
         different thing entirely -- it is what a server restart looks like.
         """
         cfg = self.settings.anomaly
+        fraction, floor = DELTA_RULES.get(
+            value.key, (cfg.delta_alert_fraction, cfg.delta_min_absolute)
+        )
         try:
             current = float(value.value)
         except (TypeError, ValueError):
@@ -206,11 +247,11 @@ class Watcher:
             before = float(previous["value"])
         except (TypeError, ValueError):
             return None
-        if before < cfg.delta_min_absolute:
+        if before < floor:
             return None
 
         change = (current - before) / before
-        if abs(change) < cfg.delta_alert_fraction:
+        if abs(change) < fraction:
             return None
         return {
             "subject": subject,
@@ -220,6 +261,7 @@ class Watcher:
             "change": change,
             "label": value.label,
             "url": value.url,
+            "health": value.key in HEALTH_KEYS,
         }
 
     # -- rate anomalies ---------------------------------------------------- #
