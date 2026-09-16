@@ -1,0 +1,22 @@
+[project]
+name = "valve-food-monitor"
+version = "1.0.0"
+description = "Restaurant Demand Monitor for the area around Valve's HQ in Bellevue, WA"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.lint]
+# Deliberately pyflakes + pycodestyle only. The code targets 3.12 but stays
+# 3.9-compatible at runtime, so pyupgrade (UP) rules would demand PEP 585
+# syntax that 3.9 cannot evaluate at import time in non-annotation positions.
+select = ["E", "F", "W"]
+ignore = ["E501"]

@@ -1,0 +1,98 @@
+name: monitor
+
+# Scheduled runs on GitHub's shared runners are best-effort: they are frequently
+# delayed by several minutes and are occasionally skipped entirely during peak
+# load. Nothing in this system assumes an exact 20-minute cadence -- baselines
+# are built from a +/-60 minute local-time window and cooldowns are measured
+# from real timestamps, so a late or missed run only costs one data point.
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Do not send Telegram messages, print them instead"
+        type: boolean
+        default: false
+      limit:
+        description: "Only check the N nearest open venues"
+        type: string
+        default: ""
+      log_level:
+        description: "Log level"
+        type: choice
+        options: [INFO, DEBUG, WARNING]
+        default: INFO
+
+permissions:
+  contents: read
+
+# Never let a delayed run overlap with the next scheduled one.
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run monitoring pass
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BESTTIME_API_KEY_PRIVATE: ${{ secrets.BESTTIME_API_KEY_PRIVATE }}
+          BESTTIME_API_KEY_PUBLIC: ${{ secrets.BESTTIME_API_KEY_PUBLIC }}
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
+          # Non-secret tuning lives in repository variables so it can be
+          # changed from the UI without a commit.
+          OFFICE_NAME: ${{ vars.OFFICE_NAME }}
+          OFFICE_ADDRESS: ${{ vars.OFFICE_ADDRESS }}
+          OFFICE_LAT: ${{ vars.OFFICE_LAT }}
+          OFFICE_LON: ${{ vars.OFFICE_LON }}
+          OFFICE_TIMEZONE: ${{ vars.OFFICE_TIMEZONE }}
+          SEARCH_RADIUS_METERS: ${{ vars.SEARCH_RADIUS_METERS }}
+          ANOMALY_MULTIPLIER: ${{ vars.ANOMALY_MULTIPLIER }}
+          MIN_BASELINE_SAMPLES: ${{ vars.MIN_BASELINE_SAMPLES }}
+          BASELINE_LOOKBACK_WEEKS: ${{ vars.BASELINE_LOOKBACK_WEEKS }}
+          BASELINE_WINDOW_MINUTES: ${{ vars.BASELINE_WINDOW_MINUTES }}
+          ALERT_COOLDOWN_MINUTES: ${{ vars.ALERT_COOLDOWN_MINUTES }}
+          SEND_RECOVERY_ALERTS: ${{ vars.SEND_RECOVERY_ALERTS }}
+          MAX_VENUES_PER_RUN: ${{ vars.MAX_VENUES_PER_RUN }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
+          LOG_FORMAT: json
+        run: |
+          python -m scripts.monitor ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+
+      # Housekeeping: keep the observations table bounded. Runs on the hour
+      # only, so it costs nothing on the other 2 runs per hour.
+      #
+      # 70 days is BASELINE_LOOKBACK_WEEKS (8 weeks = 56 days) plus two weeks of
+      # slack. Retaining longer buys nothing -- the baseline query never looks
+      # past the horizon -- and at the default caps it would push the
+      # observations table past a 500 MB free-tier database.
+      - name: Purge observations older than the baseline horizon
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RETENTION_DAYS: ${{ vars.OBSERVATION_RETENTION_DAYS || '70' }}
+        run: |
+          if [ "$(date -u +%M)" -lt 20 ]; then
+            python -m scripts.monitor --purge-days "$RETENTION_DAYS" --purge-only || true
+          else
+            echo "skipping purge this run"
+          fi

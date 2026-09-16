@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+config/providers.json
+
+# Runtime state / local database
+*.db
+*.sqlite
+*.sqlite3
+data/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
