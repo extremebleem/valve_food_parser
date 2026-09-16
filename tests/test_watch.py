@@ -455,14 +455,12 @@ class SilenceAwareClient:
         return True
 
 
-def with_mention(settings, mention="@hbbsx", **kw):
-    return dataclasses.replace(
-        settings, telegram=dataclasses.replace(settings.telegram, mention=mention, **kw)
-    )
+def tuned_telegram(settings, **kw):
+    return dataclasses.replace(settings, telegram=dataclasses.replace(settings.telegram, **kw))
 
 
-def test_a_change_carries_the_mention_and_pings(settings, storage):
-    tuned = with_mention(settings)
+def test_a_change_is_sent_with_sound(settings, storage):
+    tuned = tuned_telegram(settings)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "100")]},
@@ -473,13 +471,11 @@ def test_a_change_carries_the_mention_and_pings(settings, storage):
                  client=client).run()
     change = [m for m in client.messages if "У Valve" in m["text"]]
     assert len(change) == 1
-    # the mention must be first so it is visible in the notification preview
-    assert change[0]["text"].startswith("@hbbsx")
     assert change[0]["silent"] is False
 
 
-def test_a_routine_run_is_silent_and_unmentioned(settings, storage):
-    tuned = with_mention(settings)
+def test_a_routine_run_is_sent_silently(settings, storage):
+    tuned = tuned_telegram(settings)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     values = {subject.id: [value(subject, "required_version", "100")]}
@@ -491,12 +487,11 @@ def test_a_routine_run_is_silent_and_unmentioned(settings, storage):
     assert len(client.messages) == 1
     routine = client.messages[0]
     assert routine["silent"] is True
-    assert "@hbbsx" not in routine["text"]
     assert "изменений нет" in routine["text"]
 
 
 def test_a_run_with_changes_sends_no_routine_message(settings, storage):
-    tuned = with_mention(settings)
+    tuned = tuned_telegram(settings)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "100")]},
@@ -509,7 +504,11 @@ def test_a_run_with_changes_sends_no_routine_message(settings, storage):
     assert len(client.messages) == 1
 
 
-def test_no_mention_configured_means_no_mention_line(settings, storage):
+def test_no_personal_identifier_reaches_the_message(settings, storage):
+    """In dry-run the whole message is printed to stdout, and on a public
+    repository that log is world-readable."""
+    import re as _re
+
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     make_watcher(settings, storage, {subject.id: [value(subject, "required_version", "100")]},
@@ -517,11 +516,13 @@ def test_no_mention_configured_means_no_mention_line(settings, storage):
     client.messages.clear()
     make_watcher(settings, storage, {subject.id: [value(subject, "required_version", "101")]},
                  client=client).run()
-    assert client.messages[0]["text"].startswith("⚡")
+    text = client.messages[0]["text"]
+    assert text.startswith("⚡")
+    assert _re.search(r"@[A-Za-z0-9_]{4,}", text) is None
 
 
 def test_routine_messages_can_be_switched_off(settings, storage):
-    tuned = with_mention(settings, heartbeat=False)
+    tuned = tuned_telegram(settings, heartbeat=False)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     values = {subject.id: [value(subject, "required_version", "100")]}
@@ -534,7 +535,7 @@ def test_routine_messages_can_be_switched_off(settings, storage):
 
 def test_routine_messages_can_be_throttled(settings, storage):
     """48 runs a day is a lot of history to scroll past; one variable caps it."""
-    tuned = with_mention(settings, heartbeat_min_interval_minutes=180)
+    tuned = tuned_telegram(settings, heartbeat_min_interval_minutes=180)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
     values = {subject.id: [value(subject, "required_version", "100")]}

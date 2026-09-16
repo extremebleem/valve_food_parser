@@ -3,6 +3,11 @@
 Wording rule: say what changed and where to look. A version bump or a preview
 build is evidence that something shipped or is about to; it is not evidence of
 what that something is, and the message must not pretend otherwise.
+
+Nothing here embeds a personal identifier. In dry-run the full message is
+printed to stdout, and on a public repository that log is readable by anyone.
+Routine runs are delivered with ``disable_notification`` and changes without
+it, so an unmuted chat stays quiet until something actually moves.
 """
 
 from __future__ import annotations
@@ -190,12 +195,11 @@ class WatchNotifier:
     ) -> str:
         ordered = sorted(events, key=lambda e: (PRIORITY.get(e.key, 99), e.subject.priority))
         total = len(ordered) + len(rate_hits) + len(delta_hits)
-        parts = []
-        if self.settings.telegram.mention:
-            # A plain @username mention notifies even in a muted chat, which is
-            # exactly what separates "something changed" from a routine run.
-            parts.append(self.esc(self.settings.telegram.mention))
-        parts += [
+        # No @mention and no personal identifier of any kind: in dry-run the
+        # whole message is printed to stdout, and on a public repository that
+        # log is world-readable. Routine runs are sent silently and changes are
+        # sent normally, so an unmuted chat rings for exactly the right ones.
+        parts = [
             "⚡ <b>У Valve что-то происходит</b>",
             "<i>{} {} · {}</i>".format(
                 total,

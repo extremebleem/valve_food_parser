@@ -357,9 +357,9 @@ class Watcher:
         if self.notifier is not None:
             if events or rate_hits or delta_hits:
                 stats.alerts_sent = self.notifier.notify(events, rate_hits, delta_hits)
-            # A run with nothing to report still says so, quietly. The chat is
-            # meant to be muted: only a real change carries a mention, and only
-            # a mention breaks through the mute.
+            # A run with nothing to report still says so, quietly: it is sent
+            # with disable_notification, so an unmuted chat does not ring for
+            # routine runs and does ring for real changes.
             if not stats.alerts_sent:
                 send = getattr(self.notifier, "send_heartbeat", None)
                 if callable(send) and send(stats):

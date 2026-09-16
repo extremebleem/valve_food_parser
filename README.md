@@ -92,23 +92,26 @@ the very first run would fire one alert per watched key.
 A change is announced once. The `alerts` table keeps a fingerprint of
 `(subject, key, new value)`, so a re-read of the same value stays quiet.
 
-### Muted chat, mentioned changes
+### Quiet routine, audible changes
 
-The intended setup is a **muted chat**. Routine runs send a quiet status
-message — `disable_notification`, no mention — so the chat doubles as a
-dashboard and silence never leaves you wondering whether the thing is still
-running. A real change is sent with `TELEGRAM_MENTION` (for example `@hbbsx`)
-as the first line, and a mention breaks through a mute.
+Leave the chat **unmuted**. Routine runs are delivered with
+`disable_notification`, so they land in the history without a sound; a real
+change is sent normally and rings. The chat therefore doubles as a dashboard,
+and silence never leaves you wondering whether the thing is still running.
 
 | | Routine run | Something changed |
 | --- | --- | --- |
-| Mention | no | **yes** |
 | Notification sound | suppressed | **on** |
 | Content | current CS2 state, counters | what changed, old → new, lead time |
 
+No message carries a personal identifier. That is enforced by a test, because
+in dry-run the whole message is printed to stdout and on a public repository
+that log is readable by anyone.
+
 `TELEGRAM_HEARTBEAT=false` turns the routine message off.
 `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` throttles it — 0 means every run
-(48/day at the default cron), 360 means one status message every six hours.
+(**144/day at the `*/10` cadence**), 360 means one status message every six
+hours, which is what this deployment uses.
 
 ### Sharp moves — "did something just happen?"
 
@@ -253,7 +256,6 @@ Private chats have a positive id; groups and channels have a negative one.
 
 | Variable | Why |
 | --- | --- |
-| `TELEGRAM_MENTION` | e.g. `@hbbsx` — prepended to change notifications so they break through a muted chat. Accepted from the Secrets tab too |
 | `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` | throttle the routine status message. At the `*/10` cadence leave this at **360** or the chat gets one every ten minutes |
 | `TIMEZONE` | used to bucket daily rate history; defaults to `America/Los_Angeles` |
 | `RATE_MULTIPLIER` · `MIN_BASELINE_SAMPLES` · `BASELINE_LOOKBACK_WEEKS` | commit-burst sensitivity |

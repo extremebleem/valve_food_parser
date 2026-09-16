@@ -73,3 +73,43 @@ def test_local_time_uses_the_configured_zone(settings):
     assert MessageBuilder(settings).local_time(moment) == "12:40"
     berlin = dataclasses.replace(settings, timezone="Europe/Berlin")
     assert MessageBuilder(berlin).local_time(moment) == "21:40"
+
+
+def test_no_message_can_carry_a_personal_identifier(settings, storage):
+    """Dry-run prints the whole message to stdout, and on a public repository
+    that log is readable by anyone. Nothing in a message may identify a person.
+    """
+    import re
+
+    from src.subjects import Subject, WatchEvent
+    from src.watch_telegram import WatchNotifier
+
+    notifier = WatchNotifier(settings, storage, client=_Recorder())
+    subject = Subject.steam_app(730, "Counter-Strike 2")
+    texts = [
+        notifier.build([WatchEvent(subject, "depot_public_buildid", "1", "2")], []),
+        notifier.build_heartbeat(_Stats()),
+    ]
+    for text in texts:
+        assert re.search(r"@[A-Za-z0-9_]{4,}", text) is None, text[:200]
+
+
+def test_telegram_config_has_no_mention_field(settings):
+    """Removed deliberately: the chat is unmuted, so a mention bought nothing
+    and would have leaked a username into a public log."""
+    assert not hasattr(settings.telegram, "mention")
+
+
+class _Recorder:
+    def __init__(self):
+        self.messages = []
+
+    def send_message(self, text, silent=None):
+        self.messages.append(text)
+        return True
+
+
+class _Stats:
+    values_read = 3
+    subjects_read = 2
+    subjects_failed = 0
