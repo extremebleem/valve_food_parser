@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 
 import pytest
 
@@ -40,7 +42,7 @@ class RecordingClient:
     def __init__(self):
         self.messages = []
 
-    def send_message(self, text):
+    def send_message(self, text, silent=None):
         self.messages.append(text)
         return True
 
@@ -93,8 +95,9 @@ def test_subject_ids_are_stable():
 # --------------------------------------------------------------------------- #
 
 
-def test_first_run_records_state_and_sends_nothing(settings, storage):
-    """Otherwise the very first run fires one alert per watched key."""
+def test_first_run_records_state_and_raises_no_alert(settings, storage):
+    """Otherwise the very first run fires one alert per watched key. It still
+    sends the quiet routine message -- that one carries no mention."""
     subject = default_subjects()[0]
     client = RecordingClient()
     watcher = make_watcher(
@@ -104,10 +107,10 @@ def test_first_run_records_state_and_sends_nothing(settings, storage):
     assert stats.changes == 0
     assert stats.changes_first_seen >= 1
     assert stats.alerts_sent == 0
-    assert client.messages == []
+    assert all("У Valve" not in m for m in client.messages)
 
 
-def test_an_unchanged_value_is_silent(settings, storage):
+def test_an_unchanged_value_raises_no_alert(settings, storage):
     subject = default_subjects()[0]
     values = {subject.id: [value(subject, "required_version", "100")]}
     client = RecordingClient()
@@ -116,7 +119,8 @@ def test_an_unchanged_value_is_silent(settings, storage):
 
     stats = make_watcher(settings, storage, values, client).run()
     assert stats.changes == 0
-    assert client.messages == []
+    assert stats.alerts_sent == 0
+    assert all("У Valve" not in m for m in client.messages)
 
 
 def test_a_changed_value_alerts(settings, storage):
@@ -433,3 +437,134 @@ def test_a_non_numeric_delta_is_ignored(settings, storage):
     storage.upsert_subjects([subject])
     watcher = make_watcher(settings, storage, {})
     assert watcher.check_delta(subject, value(subject, "players_current", "n/a")) is None
+
+
+# --------------------------------------------------------------------------- #
+# mention on change, quiet routine status
+# --------------------------------------------------------------------------- #
+
+
+class SilenceAwareClient:
+    """Records whether each message was sent silently."""
+
+    def __init__(self):
+        self.messages = []
+
+    def send_message(self, text, silent=None):
+        self.messages.append({"text": text, "silent": silent})
+        return True
+
+
+def with_mention(settings, mention="@hbbsx", **kw):
+    return dataclasses.replace(
+        settings, telegram=dataclasses.replace(settings.telegram, mention=mention, **kw)
+    )
+
+
+def test_a_change_carries_the_mention_and_pings(settings, storage):
+    tuned = with_mention(settings)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "100")]},
+                 client=client).run()
+    client.messages.clear()
+
+    make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "101")]},
+                 client=client).run()
+    change = [m for m in client.messages if "У Valve" in m["text"]]
+    assert len(change) == 1
+    # the mention must be first so it is visible in the notification preview
+    assert change[0]["text"].startswith("@hbbsx")
+    assert change[0]["silent"] is False
+
+
+def test_a_routine_run_is_silent_and_unmentioned(settings, storage):
+    tuned = with_mention(settings)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    values = {subject.id: [value(subject, "required_version", "100")]}
+    make_watcher(tuned, storage, values, client=client).run()
+    client.messages.clear()
+
+    stats = make_watcher(tuned, storage, values, client=client).run()
+    assert stats.heartbeats_sent == 1
+    assert len(client.messages) == 1
+    routine = client.messages[0]
+    assert routine["silent"] is True
+    assert "@hbbsx" not in routine["text"]
+    assert "изменений нет" in routine["text"]
+
+
+def test_a_run_with_changes_sends_no_routine_message(settings, storage):
+    tuned = with_mention(settings)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "100")]},
+                 client=client).run()
+    client.messages.clear()
+
+    stats = make_watcher(tuned, storage, {subject.id: [value(subject, "required_version", "101")]},
+                         client=client).run()
+    assert stats.heartbeats_sent == 0
+    assert len(client.messages) == 1
+
+
+def test_no_mention_configured_means_no_mention_line(settings, storage):
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    make_watcher(settings, storage, {subject.id: [value(subject, "required_version", "100")]},
+                 client=client).run()
+    client.messages.clear()
+    make_watcher(settings, storage, {subject.id: [value(subject, "required_version", "101")]},
+                 client=client).run()
+    assert client.messages[0]["text"].startswith("⚡")
+
+
+def test_routine_messages_can_be_switched_off(settings, storage):
+    tuned = with_mention(settings, heartbeat=False)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    values = {subject.id: [value(subject, "required_version", "100")]}
+    make_watcher(tuned, storage, values, client=client).run()
+    client.messages.clear()
+    stats = make_watcher(tuned, storage, values, client=client).run()
+    assert stats.heartbeats_sent == 0
+    assert client.messages == []
+
+
+def test_routine_messages_can_be_throttled(settings, storage):
+    """48 runs a day is a lot of history to scroll past; one variable caps it."""
+    tuned = with_mention(settings, heartbeat_min_interval_minutes=180)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    values = {subject.id: [value(subject, "required_version", "100")]}
+
+    first = make_watcher(tuned, storage, values, client=client).run()
+    second = make_watcher(tuned, storage, values, client=client).run()
+    third = make_watcher(tuned, storage, values, client=client).run()
+    assert first.heartbeats_sent == 1     # nothing sent before, so it goes out
+    assert second.heartbeats_sent == 0    # inside the 180-minute window
+    assert third.heartbeats_sent == 0
+
+
+def test_the_routine_message_carries_state_worth_reading(settings, storage):
+    from src.watch_telegram import WatchNotifier
+
+    subject = Subject.steam_app(730, "Counter-Strike 2")
+    storage.upsert_subjects([subject])
+    storage.set_watch_value(value(subject, "cs2_scheduler", "normal", label="матчмейкинг: normal"))
+    storage.set_watch_value(value(subject, "players_current", "1186514", label="1 186 514 игроков"))
+
+    notifier = WatchNotifier(settings, storage, client=SilenceAwareClient())
+    text = notifier.build_heartbeat(make_watcher(settings, storage, {}).run())
+    assert "матчмейкинг: normal" in text
+    assert "1 186 514 игроков" in text
+
+
+def test_the_routine_message_reports_failed_sources(settings, storage):
+    from src.watch_telegram import WatchNotifier
+
+    subjects = default_subjects()
+    stats = make_watcher(settings, storage, {}, fail_for={subjects[0].name}).run()
+    notifier = WatchNotifier(settings, storage, client=SilenceAwareClient())
+    assert "источников не ответило: 1" in notifier.build_heartbeat(stats)

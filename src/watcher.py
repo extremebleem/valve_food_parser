@@ -63,13 +63,14 @@ class WatchStats:
         self.rate_anomalies = 0
         self.sharp_moves = 0
         self.alerts_sent = 0
+        self.heartbeats_sent = 0
         self.duration_seconds = 0.0
 
     def as_logline(self) -> str:
         return (
             "subjects_total={} subjects_read={} subjects_failed={} values={} "
             "changes={} first_seen={} rate_anomalies={} sharp_moves={} "
-            "alerts_sent={} duration={:.1f}s".format(
+            "alerts_sent={} heartbeat={} duration={:.1f}s".format(
                 self.subjects_total,
                 self.subjects_read,
                 self.subjects_failed,
@@ -79,6 +80,7 @@ class WatchStats:
                 self.rate_anomalies,
                 self.sharp_moves,
                 self.alerts_sent,
+                self.heartbeats_sent,
                 self.duration_seconds,
             )
         )
@@ -302,8 +304,16 @@ class Watcher:
                         rate_hits.append(hit)
                         stats.rate_anomalies += 1
 
-        if self.notifier is not None and (events or rate_hits or delta_hits):
-            stats.alerts_sent = self.notifier.notify(events, rate_hits, delta_hits)
+        if self.notifier is not None:
+            if events or rate_hits or delta_hits:
+                stats.alerts_sent = self.notifier.notify(events, rate_hits, delta_hits)
+            # A run with nothing to report still says so, quietly. The chat is
+            # meant to be muted: only a real change carries a mention, and only
+            # a mention breaks through the mute.
+            if not stats.alerts_sent:
+                send = getattr(self.notifier, "send_heartbeat", None)
+                if callable(send) and send(stats):
+                    stats.heartbeats_sent = 1
 
         stats.duration_seconds = round(time.monotonic() - started_wall, 2)
         self._report(stats, started, events, rate_hits)

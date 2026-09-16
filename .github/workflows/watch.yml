@@ -82,6 +82,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL || 'sqlite:///data/monitor.db' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # a plain @username mention breaks through a muted chat, so routine
+          # runs stay silent and only real changes ping
+          TELEGRAM_MENTION: ${{ vars.TELEGRAM_MENTION }}
+          TELEGRAM_HEARTBEAT: ${{ vars.TELEGRAM_HEARTBEAT }}
+          TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES: ${{ vars.TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES }}
           # free, and raises the GitHub API limit from 60/h to 1000/h
           GITHUB_TOKEN: ${{ github.token }}
           # optional; unlocks the CS2 matchmaking/scheduler signal

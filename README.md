@@ -92,6 +92,24 @@ the very first run would fire one alert per watched key.
 A change is announced once. The `alerts` table keeps a fingerprint of
 `(subject, key, new value)`, so a re-read of the same value stays quiet.
 
+### Muted chat, mentioned changes
+
+The intended setup is a **muted chat**. Routine runs send a quiet status
+message — `disable_notification`, no mention — so the chat doubles as a
+dashboard and silence never leaves you wondering whether the thing is still
+running. A real change is sent with `TELEGRAM_MENTION` (for example `@hbbsx`)
+as the first line, and a mention breaks through a mute.
+
+| | Routine run | Something changed |
+| --- | --- | --- |
+| Mention | no | **yes** |
+| Notification sound | suppressed | **on** |
+| Content | current CS2 state, counters | what changed, old → new, lead time |
+
+`TELEGRAM_HEARTBEAT=false` turns the routine message off.
+`TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` throttles it — 0 means every run
+(48/day at the default cron), 360 means one status message every six hours.
+
 ### Sharp moves — "did something just happen?"
 
 Player counts and server counts move constantly and have a strong daily cycle,
@@ -230,6 +248,13 @@ Private chats have a positive id; groups and channels have a negative one.
 | `TELEGRAM_CHAT_ID` | **yes** | target chat |
 | `STEAM_WEB_API_KEY` | no, but **recommended** | free and instant from [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey). Unlocks the CS2 matchmaking/scheduler signal — the earliest CS2 warning available. Without it that provider stays dormant and everything else still works. |
 | `DATABASE_URL` | no | leave unset to keep state in a workflow artifact |
+
+### Variables worth setting
+
+| Variable | Why |
+| --- | --- |
+| `TELEGRAM_MENTION` | e.g. `@hbbsx` — what gets prepended to change notifications so they break through a muted chat |
+| `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` | throttle the routine status message; 0 (default) is every run |
 
 Everything else is keyless, and the GitHub API token is provided by Actions
 automatically.

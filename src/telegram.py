@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .config import Settings
 from .http import HttpError, client_from_settings
@@ -113,16 +113,22 @@ class TelegramClient:
     def _url(self, method: str) -> str:
         return "{}/bot{}/{}".format(self.cfg.api_base.rstrip("/"), self.cfg.bot_token, method)
 
-    def send_message(self, text: str) -> bool:
-        """Returns True when every chunk was accepted (or printed in dry-run)."""
+    def send_message(self, text: str, silent: Optional[bool] = None) -> bool:
+        """Returns True when every chunk was accepted (or printed in dry-run).
+
+        ``silent=True`` suppresses the notification sound for this message even
+        when the chat is not muted -- used for routine status messages, so only
+        real changes ever ping.
+        """
+        quiet = self.cfg.disable_notification if silent is None else bool(silent)
         chunks = split_message(text)
 
         if self.dry_run or not self.configured:
             reason = "DRY_RUN" if self.dry_run else "telegram not configured"
             for index, chunk in enumerate(chunks, start=1):
                 print(
-                    "\n--- [{}] telegram message {}/{} ---\n{}\n".format(
-                        reason, index, len(chunks), chunk
+                    "\n--- [{}{}] telegram message {}/{} ---\n{}\n".format(
+                        reason, ", silent" if quiet else "", index, len(chunks), chunk
                     )
                 )
             log.info(
@@ -141,7 +147,7 @@ class TelegramClient:
                         "text": chunk,
                         "parse_mode": self.cfg.parse_mode,
                         "disable_web_page_preview": True,
-                        "disable_notification": self.cfg.disable_notification,
+                        "disable_notification": quiet,
                     },
                     cache_ttl=0,
                 )

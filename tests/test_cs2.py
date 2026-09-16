@@ -25,7 +25,7 @@ class RecordingClient:
     def __init__(self):
         self.messages = []
 
-    def send_message(self, text):
+    def send_message(self, text, silent=None):
         self.messages.append(text)
         return True
 

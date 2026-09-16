@@ -92,6 +92,14 @@ class TelegramConfig:
     api_base: str = "https://api.telegram.org"
     parse_mode: str = "HTML"
     disable_notification: bool = False
+    #: prepended to change notifications. A plain @username mention breaks
+    #: through a muted chat, which is the point: the chat stays silent for
+    #: routine runs and only real changes ping.
+    mention: str = ""
+    #: send a quiet status message on runs with nothing to report
+    heartbeat: bool = True
+    #: 0 = every run; otherwise the minimum gap between status messages
+    heartbeat_min_interval_minutes: int = 0
 
     @property
     def configured(self) -> bool:
@@ -165,6 +173,9 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
         or "https://api.telegram.org",
         parse_mode=env_str("TELEGRAM_PARSE_MODE", "HTML") or "HTML",
         disable_notification=env_bool("TELEGRAM_DISABLE_NOTIFICATION", False),
+        mention=env_str("TELEGRAM_MENTION", "") or "",
+        heartbeat=env_bool("TELEGRAM_HEARTBEAT", True),
+        heartbeat_min_interval_minutes=env_int("TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES", 0),
     )
 
     anomaly = AnomalyConfig(

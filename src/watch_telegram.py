@@ -151,7 +151,12 @@ class WatchNotifier:
     ) -> str:
         ordered = sorted(events, key=lambda e: (PRIORITY.get(e.key, 99), e.subject.priority))
         total = len(ordered) + len(rate_hits) + len(delta_hits)
-        parts = [
+        parts = []
+        if self.settings.telegram.mention:
+            # A plain @username mention notifies even in a muted chat, which is
+            # exactly what separates "something changed" from a routine run.
+            parts.append(self.esc(self.settings.telegram.mention))
+        parts += [
             "⚡ <b>У Valve что-то происходит</b>",
             "<i>{} {} · {}</i>".format(
                 total,
@@ -227,7 +232,7 @@ class WatchNotifier:
             return 0
 
         text = self.build(fresh, rate_hits, delta_hits)
-        delivered = self.client.send_message(text)
+        delivered = self.client.send_message(text, silent=False)
 
         for event in fresh:
             self.storage.record_alert(
@@ -244,3 +249,84 @@ class WatchNotifier:
                 )
             )
         return (len(fresh) + len(rate_hits) + len(delta_hits)) if delivered else 0
+
+
+    # -- routine status ---------------------------------------------------- #
+
+    HEARTBEAT_KIND = "heartbeat"
+    HEARTBEAT_SUBJECT = "_system"
+
+    def heartbeat_due(self, now: Optional[Any] = None) -> bool:
+        """Throttle for the routine message.
+
+        ``TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES = 0`` means every run, which
+        is the default; a muted chat makes that harmless, but a longer gap keeps
+        the history readable.
+        """
+        cfg = self.settings.telegram
+        if not cfg.heartbeat:
+            return False
+        gap = cfg.heartbeat_min_interval_minutes
+        if gap <= 0:
+            return True
+        previous = self.storage.last_alert(self.HEARTBEAT_SUBJECT, self.HEARTBEAT_KIND)
+        if previous is None or previous.sent_at is None:
+            return True
+        now = now or utcnow()
+        return (now - previous.sent_at).total_seconds() / 60.0 >= gap
+
+    def build_heartbeat(self, stats: Any) -> str:
+        """A status line worth reading, not just "still alive".
+
+        Carries the values people actually want to glance at, so a muted chat
+        doubles as a dashboard.
+        """
+        lines = [
+            "🟢 <b>Проверка выполнена, изменений нет</b>",
+            "<i>{} · прочитано {} значений у {} объектов</i>".format(
+                self.time.local_time(utcnow()),
+                getattr(stats, "values_read", 0),
+                getattr(stats, "subjects_read", 0),
+            ),
+            "",
+        ]
+
+        highlights = [
+            ("steam_app:730", "cs2_app_version", "CS2 версия"),
+            ("steam_app:730", "cs2_scheduler", "CS2 матчмейкинг"),
+            ("steam_app:730", "required_version", "CS2 сервер"),
+            ("steam_app:730", "players_current", "CS2 онлайн"),
+            ("steam_app:730", "sdr_revision", "конфиг сети"),
+            ("steam_feed:1675200", "latest_prerelease", "последний пре-релиз"),
+        ]
+        for subject_id, key, title in highlights:
+            stored = self.storage.get_watch_value(subject_id, key)
+            if not stored:
+                continue
+            shown = stored.get("label") or stored.get("value")
+            lines.append("• {}: {}".format(title, self.esc(str(shown)[:70])))
+
+        failed = getattr(stats, "subjects_failed", 0)
+        if failed:
+            lines += ["", "⚠️ источников не ответило: {}".format(failed)]
+        return "\n".join(lines)
+
+    def send_heartbeat(self, stats: Any) -> bool:
+        if not self.heartbeat_due():
+            log.info("heartbeat throttled")
+            return False
+        delivered = self.client.send_message(self.build_heartbeat(stats), silent=True)
+        self.storage.record_alert(
+            AlertRecord(
+                venue_id=self.HEARTBEAT_SUBJECT,
+                kind=self.HEARTBEAT_KIND,
+                load_score=0.0,
+                baseline_score=0.0,
+                deviation_percent=0.0,
+                metric_type="heartbeat",
+                sent_at=utcnow(),
+                message_hash="",
+                delivered=delivered,
+            )
+        )
+        return delivered
