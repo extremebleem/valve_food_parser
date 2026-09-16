@@ -74,6 +74,51 @@ it before anyone posts about it.
 | CS2 achievements | `GetGlobalAchievementPercentagesForApp` | ❌ returns exactly **1** achievement; "new achievement = new content" does not work |
 | `ValveSoftware/steam-runtime` releases | GitHub | ❌ zero releases — it uses dated tags (`v0.20260818.0`) instead |
 
+## Round 4 — depot build ids, finally reachable (2026-09-17)
+
+Written off three times as unreachable. It is not: **`steamcmd +login anonymous
++app_info_print 730`** works, needs no account, and returns the whole
+`depots > branches` block.
+
+```
+public       buildid=25218825   timeupdated 2026-09-09 22:49 UTC
+csgo_legacy  buildid=12426195
+1.41.7.4     buildid=24537688   2026-08-03 21:18 UTC
+… 13 branches in total
+```
+
+A run takes about 6 seconds against an already-bootstrapped steamcmd. This is
+the earliest public signal that exists: the build id changes when Valve pushes
+content, before any announcement and before anyone dumps the files. The *set*
+of branch names is watched too, because a new pinned version branch tends to
+appear ahead of the public push.
+
+### What this replaced
+
+`SteamTracking/GameTracking-*` was considered and dropped. Its commit message
+looks like a build id but `update.sh` line 73 reads it out of the downloaded
+game files:
+
+```sh
+CreateCommit "$(grep "ClientVersion=" game/csgo/steam.inf | grep -o '[0-9\.]*')"
+```
+
+So it can only appear *after* the depot is public and the files have been
+pulled — a confirmation, not a warning. The same timing objection applies to
+`Protobufs`, `SteamTracking` and `SteamworksDocumentation`: all are dumped from
+shipped builds. Useful for datamining what is coming next, useless for knowing
+that something is coming.
+
+`steamstat.us` is not used at all: its maintainers state the data endpoint is
+for that site only.
+
+### Still out of reach
+
+The CS2 dedicated server is appid **2347773** (from `steam.inf`, not 740 as
+guessed earlier). It answers nothing on `UpToDateCheck`, `IGCVersion`,
+`GetSDRConfig` or `GetNewsForApp` — a depot-only app, reachable through PICS
+alone.
+
 ## Consequence for the design
 
 Two different mechanisms, not one:

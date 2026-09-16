@@ -21,6 +21,7 @@ from src.providers.cs2 import (
     SteamSDRProvider,
 )
 from src.providers.github import GitHubProvider
+from src.providers.steam_depot import SteamDepotProvider
 from src.providers.steam_infra import SteamInfraProvider
 from src.providers.steam import SteamNewsProvider, SteamVersionProvider
 from src.storage import StorageError, create_storage
@@ -32,6 +33,7 @@ log = get_logger(__name__)
 
 def build_providers(settings):
     providers = [
+        SteamDepotProvider(settings),
         SteamVersionProvider(settings),
         SteamNewsProvider(settings),
         SteamSDRProvider(settings),

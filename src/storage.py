@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS subjects (
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, external_id TEXT NOT NULL,
     name TEXT NOT NULL, url TEXT DEFAULT '', active INTEGER DEFAULT 1,
     priority INTEGER DEFAULT 100, meta TEXT DEFAULT '{}',
-    first_seen TEXT, last_seen TEXT
+    min_interval_minutes INTEGER DEFAULT 0,
+    first_seen TEXT, last_seen TEXT, last_read TEXT
 );
 
 -- one row per (subject, watched key): what we saw last time
@@ -155,7 +156,16 @@ class BaseStorage:
 
     # -- subjects ---------------------------------------------------------- #
 
-    SUBJECT_COLUMNS = "id, kind, external_id, name, url, active, priority, meta, first_seen, last_seen"
+    SUBJECT_COLUMNS = (
+        "id, kind, external_id, name, url, active, priority, meta, "
+        "min_interval_minutes, first_seen, last_seen, last_read"
+    )
+
+    #: columns added after the first release; applied idempotently on migrate
+    ADDED_COLUMNS = (
+        ("subjects", "min_interval_minutes", "INTEGER DEFAULT 0"),
+        ("subjects", "last_read", "TEXT"),
+    )
 
     def upsert_subjects(self, subjects: Sequence[Any]) -> Dict[str, int]:
         if not subjects:
@@ -172,20 +182,23 @@ class BaseStorage:
                 self.bool_true if subject.active else self.bool_false,
                 int(subject.priority),
                 json.dumps(subject.meta, ensure_ascii=False),
+                int(subject.min_interval_minutes),
             )
             if subject.id in existing:
                 self.execute(
                     "UPDATE subjects SET kind=?, external_id=?, name=?, url=?, active=?, "
-                    "priority=?, meta=?, last_seen=? WHERE id=?",
+                    "priority=?, meta=?, min_interval_minutes=?, last_seen=? WHERE id=?",
                     common + (self.ts(now), subject.id),
                 )
                 updated += 1
             else:
                 self.execute(
-                    "INSERT INTO subjects ({}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".format(
+                    "INSERT INTO subjects ({}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".format(
                         self.SUBJECT_COLUMNS
                     ),
-                    (subject.id,) + common + (self.ts(subject.first_seen or now), self.ts(now)),
+                    (subject.id,)
+                    + common
+                    + (self.ts(subject.first_seen or now), self.ts(now), None),
                 )
                 inserted += 1
         self.commit()
@@ -210,11 +223,20 @@ class BaseStorage:
                 active=bool(row[5]),
                 priority=int(row[6] or 100),
                 meta=json.loads(row[7] or "{}"),
-                first_seen=parse_iso(row[8]),
-                last_seen=parse_iso(row[9]),
+                min_interval_minutes=int(row[8] or 0),
+                first_seen=parse_iso(row[9]),
+                last_seen=parse_iso(row[10]),
+                last_read=parse_iso(row[11]),
             )
             for row in self.fetchall(sql, params)
         ]
+
+    def mark_subject_read(self, subject_id: str, moment: Optional[datetime] = None) -> None:
+        self.execute(
+            "UPDATE subjects SET last_read = ? WHERE id = ?",
+            (self.ts(moment or utcnow()), subject_id),
+        )
+        self.commit()
 
     # -- watch state ------------------------------------------------------- #
 
@@ -419,6 +441,11 @@ class SQLiteStorage(BaseStorage):
 
     def migrate(self) -> None:
         self.conn.executescript(SQLITE_DDL)
+        # bring databases created by an older revision up to date
+        for table, column, definition in self.ADDED_COLUMNS:
+            existing = {row[1] for row in self.fetchall("PRAGMA table_info({})".format(table))}
+            if column not in existing:
+                self.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, column, definition))
         self.conn.commit()
 
 

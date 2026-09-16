@@ -1,12 +1,15 @@
 name: watch
 
-# Valve's public state changes a few times a day at most, so this runs on a
-# modest interval rather than continuously. Every endpoint it uses is free and
-# keyless, so the interval is bounded by politeness and Actions minutes, not by
-# a quota.
+# Every ten minutes, because the depot build id is the earliest signal that
+# exists and a build can go live at any moment.
+#
+# The cadence is set by the cheapest, most valuable subject. Everything slower
+# carries its own min_interval_minutes (see src/subjects.py), so a typical run
+# reads only Counter-Strike 2 and finishes in seconds; the GitHub repositories
+# are polled hourly and the news feeds every twenty minutes or so.
 on:
   schedule:
-    - cron: "7,37 * * * *"   # twice an hour, offset off the hour
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -43,6 +46,34 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Depot build ids are not reachable over the Web API; steamcmd with an
+      # anonymous login is the only route. Cached because the tarball never
+      # changes and the self-update is the slow part.
+      - name: Cache steamcmd
+        id: steamcmd-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/steamcmd
+          key: steamcmd-${{ runner.os }}-v1
+
+      - name: Install steamcmd
+        run: |
+          set -eu
+          if [ ! -x "$HOME/steamcmd/steamcmd.sh" ]; then
+            mkdir -p "$HOME/steamcmd"
+            curl -sSL --retry 3 \
+              https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
+              | tar xz -C "$HOME/steamcmd"
+          fi
+          # the bootstrap binary is 32-bit; without this it cannot start
+          if ! dpkg -l lib32gcc-s1 >/dev/null 2>&1; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq lib32gcc-s1
+          fi
+          "$HOME/steamcmd/steamcmd.sh" +quit >/dev/null 2>&1 || true
+          echo "steamcmd ready"
 
       - name: Choose the state backend
         id: backend
@@ -89,6 +120,7 @@ jobs:
           TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES: ${{ vars.TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES }}
           # free, and raises the GitHub API limit from 60/h to 1000/h
           GITHUB_TOKEN: ${{ github.token }}
+          STEAMCMD_PATH: /home/runner/steamcmd/steamcmd.sh
           # optional; unlocks the CS2 matchmaking/scheduler signal
           STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
           DELTA_ALERT_FRACTION: ${{ vars.DELTA_ALERT_FRACTION }}

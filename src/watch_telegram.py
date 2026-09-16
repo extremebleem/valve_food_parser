@@ -20,6 +20,8 @@ from .telegram import MessageBuilder, TelegramClient, plural_ru
 log = get_logger(__name__)
 
 KEY_TITLES = {
+    "depot_public_buildid": "📦 Выложен новый билд в депот",
+    "depot_branches": "🌿 Изменился состав веток депота",
     "gc_deploy_in_flight": "🚀 Выкатка идёт прямо сейчас",
     "cs2_scheduler": "🎯 Матчмейкинг CS2 сменил состояние",
     "cs2_services": "🛠 Сервисы CS2 сменили состояние",
@@ -40,6 +42,10 @@ KEY_TITLES = {
 #: matchmaking state change are happening *now*; a pre-release post and a
 #: datacenter change are days out. Both ends matter more than the middle.
 PRIORITY = {
+    # the depot is the earliest signal there is: the build exists before
+    # anyone is told about it
+    "depot_branches": -1,
+    "depot_public_buildid": 0,
     "gc_deploy_in_flight": 0,
     "cs2_scheduler": 1,
     "cs2_services": 2,
@@ -152,9 +158,19 @@ class WatchNotifier:
         ]
         if event.label and event.key not in ("gc_deploy_in_flight", "cs2_scheduler", "cs2_services"):
             lines.append("<i>{}</i>".format(self.esc(event.label)))
-        if event.key in ("required_version", "cs2_app_version", "gc_active_version"):
+        if event.key in (
+            "required_version",
+            "cs2_app_version",
+            "gc_active_version",
+            "depot_public_buildid",
+        ):
             lines.append("<code>{} → {}</code>".format(self.esc(event.old_value), self.esc(event.new_value)))
-        if event.key == "cs2_services":
+        if event.key == "depot_branches":
+            from .providers.steam_depot import describe_branch_change
+
+            for line in describe_branch_change(event.old_value, event.new_value)[:8]:
+                lines.append("<code>{}</code>".format(self.esc(line)))
+        elif event.key == "cs2_services":
             changed = self.service_changes(event.old_value, event.new_value)
             lines.extend("<code>{}</code>".format(self.esc(c)) for c in changed[:8])
         elif event.detail:

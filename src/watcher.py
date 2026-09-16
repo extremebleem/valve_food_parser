@@ -41,6 +41,8 @@ CHANGE_KEYS = frozenset(
         "cs2_app_version",
         "cs2_scheduler",
         "cs2_services",
+        "depot_public_buildid",
+        "depot_branches",
         "steampipe_hosts",
         "steampipe_domains",
         "client_update_hosts",
@@ -94,6 +96,7 @@ class WatchStats:
     def __init__(self) -> None:
         self.subjects_total = 0
         self.subjects_read = 0
+        self.subjects_skipped = 0
         self.subjects_failed = 0
         self.values_read = 0
         self.changes = 0
@@ -106,11 +109,12 @@ class WatchStats:
 
     def as_logline(self) -> str:
         return (
-            "subjects_total={} subjects_read={} subjects_failed={} values={} "
+            "subjects_total={} subjects_read={} subjects_skipped={} subjects_failed={} values={} "
             "changes={} first_seen={} rate_anomalies={} sharp_moves={} "
             "alerts_sent={} heartbeat={} duration={:.1f}s".format(
                 self.subjects_total,
                 self.subjects_read,
+                self.subjects_skipped,
                 self.subjects_failed,
                 self.values_read,
                 self.changes,
@@ -316,7 +320,11 @@ class Watcher:
         delta_hits: List[Dict[str, Any]] = []
 
         for subject in subjects:
+            if not subject.due(started):
+                stats.subjects_skipped += 1
+                continue
             values, error = self.read_subject(subject)
+            self.storage.mark_subject_read(subject.id, started)
             if error and not values:
                 stats.subjects_failed += 1
                 continue

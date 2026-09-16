@@ -30,6 +30,8 @@ class SubjectKind:
 #: How much warning a signal typically gives. Used only to sort and label
 #: notifications -- it is a documented editorial judgement, not a measurement.
 LEAD_TIME = {
+    "depot_branches": "часы–дни — ветка появляется раньше публичной выкладки",
+    "depot_public_buildid": "минуты — билд выложен, до анонса",
     "steampipe_hosts": "дни",
     "steampipe_domains": "дни",
     "client_update_hosts": "часы–дни",
@@ -65,9 +67,21 @@ class Subject:
     url: str = ""
     active: bool = True
     priority: int = 100
+    #: do not re-read this subject more often than every N minutes. The run
+    #: cadence is set by the cheapest, most valuable signal (the depot build
+    #: id); everything slower carries its own floor so a 10-minute schedule
+    #: does not hammer the GitHub API or burn Actions minutes.
+    min_interval_minutes: int = 0
     meta: Dict[str, Any] = field(default_factory=dict)
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
+    last_read: Optional[datetime] = None
+
+    def due(self, now: datetime) -> bool:
+        """Has this subject's own minimum interval elapsed?"""
+        if self.min_interval_minutes <= 0 or self.last_read is None:
+            return True
+        return (now - self.last_read).total_seconds() / 60.0 >= self.min_interval_minutes
 
     @classmethod
     def steam_app(cls, appid: int, name: str, **kw: Any) -> "Subject":
@@ -117,6 +131,7 @@ class Subject:
         data = asdict(self)
         data["first_seen"] = iso(self.first_seen)
         data["last_seen"] = iso(self.last_seen)
+        data["last_read"] = iso(self.last_read)
         return data
 
     @classmethod
@@ -129,9 +144,11 @@ class Subject:
             url=data.get("url", "") or "",
             active=bool(data.get("active", True)),
             priority=int(data.get("priority", 100) or 100),
+            min_interval_minutes=int(data.get("min_interval_minutes", 0) or 0),
             meta=dict(data.get("meta") or {}),
             first_seen=parse_iso(data.get("first_seen")),
             last_seen=parse_iso(data.get("last_seen")),
+            last_read=parse_iso(data.get("last_read")),
         )
 
 
@@ -191,12 +208,29 @@ DEFAULT_SUBJECTS: List[Subject] = [
         730,
         "Counter-Strike 2",
         priority=1,
-        meta={"watch_sdr": True, "watch_players": True, "watch_cs2_status": True},
+        meta={
+            "watch_sdr": True,
+            "watch_players": True,
+            "watch_cs2_status": True,
+            "watch_depot": True,
+        },
     ),
-    Subject.steam_app(570, "Dota 2", priority=10, meta={"watch_gc": True, "watch_players": True}),
-    Subject.steam_app(440, "Team Fortress 2", priority=40, meta={"watch_gc": True}),
     Subject.steam_app(
-        1422450, "Deadlock", priority=10, meta={"watch_gc": True, "watch_players": True}
+        570,
+        "Dota 2",
+        priority=10,
+        min_interval_minutes=20,
+        meta={"watch_gc": True, "watch_players": True, "watch_depot": True},
+    ),
+    Subject.steam_app(
+        440, "Team Fortress 2", priority=40, min_interval_minutes=60, meta={"watch_gc": True}
+    ),
+    Subject.steam_app(
+        1422450,
+        "Deadlock",
+        priority=10,
+        min_interval_minutes=20,
+        meta={"watch_gc": True, "watch_players": True, "watch_depot": True},
     ),
     # --- feeds: beta and preview channels lead stable releases by days ------
     # 1675200 carries SteamOS Previews, SteamOS Betas *and* Steam Beta Client
@@ -206,20 +240,22 @@ DEFAULT_SUBJECTS: List[Subject] = [
     # appid 753 ("Steam") is deliberately absent: its feed returns nothing but
     # syndicated PCGamesN articles, which are somebody else's reporting rather
     # than evidence of anything. Verified 2026-09-17.
-    Subject.steam_feed(1675200, "SteamOS / Steam Deck (beta & preview)", priority=5),
-    Subject.steam_feed(730, "Counter-Strike 2 news", priority=15),
-    Subject.steam_feed(570, "Dota 2 news", priority=15),
-    Subject.steam_feed(1422450, "Deadlock news", priority=15),
+    Subject.steam_feed(
+        1675200, "SteamOS / Steam Deck (beta & preview)", priority=5, min_interval_minutes=20
+    ),
+    Subject.steam_feed(730, "Counter-Strike 2 news", priority=15, min_interval_minutes=20),
+    Subject.steam_feed(570, "Dota 2 news", priority=15, min_interval_minutes=30),
+    Subject.steam_feed(1422450, "Deadlock news", priority=15, min_interval_minutes=30),
     # --- Steam plumbing: an update is felt here before it is announced -----
-    Subject.steam_infra("Инфраструктура Steam", priority=8),
+    Subject.steam_infra("Инфраструктура Steam", priority=8, min_interval_minutes=20),
 
     # --- repositories: tags and commit bursts precede releases --------------
-    Subject.github_repo("ValveSoftware/Proton", priority=30),
-    Subject.github_repo("ValveSoftware/gamescope", priority=30),
-    Subject.github_repo("ValveSoftware/SteamOS", priority=30),
-    Subject.github_repo("ValveSoftware/steam-for-linux", priority=50),
-    Subject.github_repo("ValveSoftware/Fossilize", priority=60),
-    Subject.github_repo("ValveSoftware/source-sdk-2013", priority=60),
+    Subject.github_repo("ValveSoftware/Proton", priority=30, min_interval_minutes=60),
+    Subject.github_repo("ValveSoftware/gamescope", priority=30, min_interval_minutes=60),
+    Subject.github_repo("ValveSoftware/SteamOS", priority=30, min_interval_minutes=60),
+    Subject.github_repo("ValveSoftware/steam-for-linux", priority=50, min_interval_minutes=180),
+    Subject.github_repo("ValveSoftware/Fossilize", priority=60, min_interval_minutes=180),
+    Subject.github_repo("ValveSoftware/source-sdk-2013", priority=60, min_interval_minutes=180),
 ]
 
 

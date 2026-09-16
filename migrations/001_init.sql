@@ -10,9 +10,14 @@ CREATE TABLE IF NOT EXISTS subjects (
     active      BOOLEAN DEFAULT TRUE,
     priority    INTEGER DEFAULT 100,
     meta        TEXT DEFAULT '{}',
+    min_interval_minutes INTEGER DEFAULT 0,
     first_seen  TIMESTAMPTZ,
-    last_seen   TIMESTAMPTZ
+    last_seen   TIMESTAMPTZ,
+    last_read   TIMESTAMPTZ
 );
+
+ALTER TABLE subjects ADD COLUMN IF NOT EXISTS min_interval_minutes INTEGER DEFAULT 0;
+ALTER TABLE subjects ADD COLUMN IF NOT EXISTS last_read TIMESTAMPTZ;
 
 -- one row per (subject, watched key): what we saw last time
 CREATE TABLE IF NOT EXISTS watch_state (
