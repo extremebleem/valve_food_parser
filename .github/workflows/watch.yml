@@ -1,7 +1,9 @@
 name: watch
 
-# Every ten minutes, because the depot build id is the earliest signal that
-# exists and a build can go live at any moment.
+# Every five minutes -- the floor GitHub allows. Anything shorter is accepted
+# by the YAML parser and silently never fired, so */5 is as fast as a scheduled
+# workflow can go. Scheduling is best-effort in any case: runs are routinely
+# late and are sometimes skipped entirely, which nothing here assumes otherwise.
 #
 # The cadence is set by the cheapest, most valuable subject. Everything slower
 # carries its own min_interval_minutes (see src/subjects.py), so a typical run
@@ -9,7 +11,7 @@ name: watch
 # are polled hourly and the news feeds every twenty minutes or so.
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
