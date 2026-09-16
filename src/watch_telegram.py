@@ -291,6 +291,11 @@ class WatchNotifier:
 
         text = self.build(fresh, rate_hits, delta_hits)
         delivered = self.client.send_message(text, silent=False)
+        if delivered:
+            # The routine status message must not overwrite an alert, so the
+            # stored id is dropped: the next status starts a fresh message
+            # below this one and is edited in place from then on.
+            self.storage.clear_meta(self.HEARTBEAT_MESSAGE_KEY)
 
         for event in fresh:
             self.storage.record_alert(
@@ -313,6 +318,8 @@ class WatchNotifier:
 
     HEARTBEAT_KIND = "heartbeat"
     HEARTBEAT_SUBJECT = "_system"
+    #: id of the status message we keep editing, cleared whenever an alert is sent
+    HEARTBEAT_MESSAGE_KEY = "heartbeat_message_id"
 
     def heartbeat_due(self, now: Optional[Any] = None) -> bool:
         """Throttle for the routine message.
@@ -370,10 +377,34 @@ class WatchNotifier:
         return "\n".join(lines)
 
     def send_heartbeat(self, stats: Any) -> bool:
+        """Keep one self-updating status message instead of a stream of them.
+
+        A run with nothing to report edits the previous status message rather
+        than adding another. When the previous message was an *alert* the id
+        has been cleared, so a fresh status message is sent below it -- an
+        alert is never overwritten.
+        """
         if not self.heartbeat_due():
             log.info("heartbeat throttled")
             return False
-        delivered = self.client.send_message(self.build_heartbeat(stats), silent=True)
+
+        text = self.build_heartbeat(stats)
+        existing = self.storage.get_meta(self.HEARTBEAT_MESSAGE_KEY)
+
+        delivered = False
+        if existing and existing.isdigit():
+            delivered = self.client.edit_message(int(existing), text, silent=True)
+            if delivered:
+                log.info("heartbeat edited in place", extra={"message_id": existing})
+            else:
+                # gone, or past the 48 hours Telegram allows an edit
+                self.storage.clear_meta(self.HEARTBEAT_MESSAGE_KEY)
+
+        if not delivered:
+            delivered, message_id = self.client.send_and_get_id(text, silent=True)
+            if delivered and message_id is not None:
+                self.storage.set_meta(self.HEARTBEAT_MESSAGE_KEY, str(message_id))
+
         self.storage.record_alert(
             AlertRecord(
                 venue_id=self.HEARTBEAT_SUBJECT,

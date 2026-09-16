@@ -41,9 +41,20 @@ class StubProvider:
 class RecordingClient:
     def __init__(self):
         self.messages = []
+        self.edits = []
+        self._id = 0
 
     def send_message(self, text, silent=None):
         self.messages.append(text)
+        return True
+
+    def send_and_get_id(self, text, silent=None):
+        self.send_message(text, silent=silent)
+        self._id += 1
+        return True, self._id
+
+    def edit_message(self, message_id, text, silent=None):
+        self.edits.append({"id": message_id, "text": text})
         return True
 
 
@@ -449,9 +460,20 @@ class SilenceAwareClient:
 
     def __init__(self):
         self.messages = []
+        self.edits = []
+        self._id = 0
 
     def send_message(self, text, silent=None):
         self.messages.append({"text": text, "silent": silent})
+        return True
+
+    def send_and_get_id(self, text, silent=None):
+        self.send_message(text, silent=silent)
+        self._id += 1
+        return True, self._id
+
+    def edit_message(self, message_id, text, silent=None):
+        self.edits.append({"id": message_id, "text": text})
         return True
 
 
@@ -474,7 +496,7 @@ def test_a_change_is_sent_with_sound(settings, storage):
     assert change[0]["silent"] is False
 
 
-def test_a_routine_run_is_sent_silently(settings, storage):
+def test_a_second_routine_run_edits_instead_of_sending(settings, storage):
     tuned = tuned_telegram(settings)
     client = SilenceAwareClient()
     subject = default_subjects()[0]
@@ -484,10 +506,11 @@ def test_a_routine_run_is_sent_silently(settings, storage):
 
     stats = make_watcher(tuned, storage, values, client=client).run()
     assert stats.heartbeats_sent == 1
-    assert len(client.messages) == 1
-    routine = client.messages[0]
-    assert routine["silent"] is True
-    assert "изменений нет" in routine["text"]
+    # the second routine run edits the first status message instead of adding
+    # another, so the chat keeps exactly one self-updating status line
+    assert client.messages == []
+    assert len(client.edits) == 1
+    assert "изменений нет" in client.edits[0]["text"]
 
 
 def test_a_run_with_changes_sends_no_routine_message(settings, storage):
@@ -648,3 +671,16 @@ def test_the_interval_has_a_floor(settings, storage, monkeypatch):
     assert cli.run_loop(settings, storage, args) == 0
     # the floor is 30s, so a 200s budget cannot produce hundreds of passes
     assert clock.now >= 30
+
+
+def test_the_first_routine_run_sends_a_silent_message(settings, storage):
+    tuned = tuned_telegram(settings)
+    client = SilenceAwareClient()
+    subject = default_subjects()[0]
+    stats = make_watcher(
+        tuned, storage, {subject.id: [value(subject, "required_version", "100")]}, client=client
+    ).run()
+    assert stats.heartbeats_sent == 1
+    assert len(client.messages) == 1
+    assert client.messages[0]["silent"] is True
+    assert client.edits == []

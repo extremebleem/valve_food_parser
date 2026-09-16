@@ -320,6 +320,36 @@ class BaseStorage:
             for r in rows
         ]
 
+    # -- small key/value scratch ------------------------------------------ #
+    #
+    # Backed by watch_state under a reserved subject id, so it needs no extra
+    # table and inherits the same backend handling.
+
+    META_SUBJECT = "_system"
+
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self.get_watch_value(self.META_SUBJECT, key)
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        from .subjects import WatchValue
+
+        self.set_watch_value(
+            WatchValue(
+                subject_id=self.META_SUBJECT,
+                key=key,
+                value=str(value),
+                observed_at=utcnow(),
+            )
+        )
+
+    def clear_meta(self, key: str) -> None:
+        self.execute(
+            "DELETE FROM watch_state WHERE subject_id = ? AND key = ?",
+            (self.META_SUBJECT, key),
+        )
+        self.commit()
+
     # -- numeric history --------------------------------------------------- #
 
     def record_subject_value(

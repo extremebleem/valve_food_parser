@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Settings
 from .http import HttpError, client_from_settings
@@ -105,6 +105,7 @@ class TelegramClient:
         self.client = client_from_settings(settings, rate_limit_rps=1.0)
         self.client.cache_ttl = 0
         self.sent_count = 0
+        self._last_message_id: Optional[int] = None
 
     @property
     def configured(self) -> bool:
@@ -112,6 +113,69 @@ class TelegramClient:
 
     def _url(self, method: str) -> str:
         return "{}/bot{}/{}".format(self.cfg.api_base.rstrip("/"), self.cfg.bot_token, method)
+
+    def send_and_get_id(
+        self, text: str, silent: Optional[bool] = None
+    ) -> Tuple[bool, Optional[int]]:
+        """Send and report the resulting message id, when there is one.
+
+        ``None`` for the id means "sent, but not editable afterwards": dry-run,
+        an unconfigured bot, or a message long enough to be split into chunks.
+        """
+        chunks = split_message(text)
+        ok = self.send_message(text, silent=silent)
+        if not ok or len(chunks) != 1:
+            return ok, None
+        if self.dry_run or not self.configured:
+            # Hand back a synthetic id so the edit path is exercised and
+            # visible in a dry run. Without it every dry run looks like a
+            # fresh send and the operator cannot see what production does.
+            self._last_message_id = (self._last_message_id or 0) + 1
+            return ok, self._last_message_id
+        return ok, self._last_message_id
+
+    def edit_message(self, message_id: int, text: str, silent: Optional[bool] = None) -> bool:
+        """Rewrite a message we sent earlier.
+
+        Returns ``False`` when Telegram will not edit it -- most often because
+        the message is gone or older than the 48 hours Telegram allows -- so the
+        caller can fall back to sending a new one. "Not modified" counts as
+        success: the text is already what we wanted.
+        """
+        if self.dry_run or not self.configured:
+            print(
+                "\n--- [{}, edit #{}] telegram message ---\n{}\n".format(
+                    "DRY_RUN" if self.dry_run else "telegram not configured", message_id, text
+                )
+            )
+            return True
+        if len(split_message(text)) != 1:
+            return False
+        try:
+            payload = self.client.post_json(
+                self._url("editMessageText"),
+                json_body={
+                    "chat_id": self.cfg.chat_id,
+                    "message_id": int(message_id),
+                    "text": text,
+                    "parse_mode": self.cfg.parse_mode,
+                    "disable_web_page_preview": True,
+                },
+                cache_ttl=0,
+            )
+        except HttpError as exc:
+            body = (exc.body or "").lower()
+            if "not modified" in body:
+                return True
+            log.info(
+                "telegram edit declined, will send instead",
+                extra={"message_id": message_id, "status": exc.status, "body": exc.body[:160]},
+            )
+            return False
+        if isinstance(payload, dict) and not payload.get("ok", False):
+            log.info("telegram edit rejected", extra={"response": str(payload)[:200]})
+            return False
+        return True
 
     def send_message(self, text: str, silent: Optional[bool] = None) -> bool:
         """Returns True when every chunk was accepted (or printed in dry-run).
@@ -156,6 +220,9 @@ class TelegramClient:
                     ok = False
                 else:
                     self.sent_count += 1
+                    result = payload.get("result") if isinstance(payload, dict) else None
+                    if isinstance(result, dict) and result.get("message_id") is not None:
+                        self._last_message_id = int(result["message_id"])
             except HttpError as exc:
                 log.error(
                     "telegram send failed",

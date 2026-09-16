@@ -94,15 +94,24 @@ A change is announced once. The `alerts` table keeps a fingerprint of
 
 ### Quiet routine, audible changes
 
-Leave the chat **unmuted**. Routine runs are delivered with
-`disable_notification`, so they land in the history without a sound; a real
-change is sent normally and rings. The chat therefore doubles as a dashboard,
-and silence never leaves you wondering whether the thing is still running.
+Leave the chat **unmuted**. A real change is sent normally and rings. A routine
+run does not add a message at all — it **edits the previous status message in
+place**, silently, so the chat accumulates only real events with a single
+self-updating status line underneath them.
 
 | | Routine run | Something changed |
 | --- | --- | --- |
+| Delivery | edits the last status message | new message |
 | Notification sound | suppressed | **on** |
 | Content | current CS2 state, counters | what changed, old → new, lead time |
+
+An alert is never overwritten: sending one drops the stored message id, so the
+next status starts a fresh message below the alert and is edited from then on.
+If Telegram refuses the edit — the message was deleted, or is past the 48 hours
+it allows — the status is sent as a new message instead.
+
+A dry run shows which of the two will happen: `[DRY_RUN, silent]` for a send,
+`[DRY_RUN, edit #N]` for an edit.
 
 No message carries a personal identifier. That is enforced by a test, because
 in dry-run the whole message is printed to stdout and on a public repository

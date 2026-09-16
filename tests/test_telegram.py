@@ -113,3 +113,125 @@ class _Stats:
     values_read = 3
     subjects_read = 2
     subjects_failed = 0
+
+
+# --------------------------------------------------------------------------- #
+# one self-updating status message
+# --------------------------------------------------------------------------- #
+
+
+class EditingClient:
+    """Records sends and edits, and hands out message ids like Telegram does."""
+
+    def __init__(self, edit_ok=True):
+        self.sent = []
+        self.edited = []
+        self.edit_ok = edit_ok
+        self._next_id = 100
+
+    def send_message(self, text, silent=None):
+        self.sent.append({"text": text, "silent": silent})
+        return True
+
+    def send_and_get_id(self, text, silent=None):
+        self.send_message(text, silent=silent)
+        self._next_id += 1
+        return True, self._next_id
+
+    def edit_message(self, message_id, text, silent=None):
+        self.edited.append({"id": message_id, "text": text})
+        return self.edit_ok
+
+
+def notifier_with(settings, storage, client):
+    from src.watch_telegram import WatchNotifier
+
+    return WatchNotifier(settings, storage, client=client)
+
+
+class _S:
+    values_read = 5
+    subjects_read = 3
+    subjects_failed = 0
+
+
+def test_the_first_status_message_is_sent_then_edited(settings, storage):
+    client = EditingClient()
+    n = notifier_with(settings, storage, client)
+
+    assert n.send_heartbeat(_S()) is True
+    assert len(client.sent) == 1 and client.edited == []
+
+    assert n.send_heartbeat(_S()) is True
+    assert len(client.sent) == 1, "a second status message must not be sent"
+    assert len(client.edited) == 1
+    assert client.edited[0]["id"] == 101
+
+
+def test_an_alert_is_never_overwritten(settings, storage):
+    """After an alert the stored id is dropped, so the next status starts a
+    fresh message below it instead of editing the alert away."""
+    from src.subjects import Subject, WatchEvent
+
+    client = EditingClient()
+    n = notifier_with(settings, storage, client)
+    n.send_heartbeat(_S())           # status #101
+    n.send_heartbeat(_S())           # edited in place
+    assert len(client.edited) == 1
+
+    subject = Subject.steam_app(730, "CS2")
+    storage.upsert_subjects([subject])
+    n.notify([WatchEvent(subject, "depot_public_buildid", "1", "2")], [])
+
+    before = len(client.edited)
+    n.send_heartbeat(_S())
+    assert len(client.edited) == before, "the alert was edited instead of preserved"
+    assert len(client.sent) == 3, "a new status message should follow the alert"
+
+
+def test_a_refused_edit_falls_back_to_sending(settings, storage):
+    """Telegram refuses to edit a message that is gone or older than 48 hours."""
+    client = EditingClient(edit_ok=False)
+    n = notifier_with(settings, storage, client)
+    n.send_heartbeat(_S())
+    assert len(client.sent) == 1
+
+    assert n.send_heartbeat(_S()) is True
+    assert len(client.edited) == 1      # tried
+    assert len(client.sent) == 2        # and then sent instead
+
+
+def test_the_stored_id_is_cleared_when_an_edit_is_refused(settings, storage):
+    client = EditingClient(edit_ok=False)
+    n = notifier_with(settings, storage, client)
+    n.send_heartbeat(_S())
+    first = storage.get_meta(n.HEARTBEAT_MESSAGE_KEY)
+    n.send_heartbeat(_S())
+    assert storage.get_meta(n.HEARTBEAT_MESSAGE_KEY) != first
+
+
+def test_status_messages_stay_silent_whether_sent_or_edited(settings, storage):
+    client = EditingClient()
+    n = notifier_with(settings, storage, client)
+    n.send_heartbeat(_S())
+    n.send_heartbeat(_S())
+    assert all(m["silent"] is True for m in client.sent)
+
+
+def test_meta_storage_round_trip(storage):
+    assert storage.get_meta("nothing") is None
+    storage.set_meta("k", "42")
+    assert storage.get_meta("k") == "42"
+    storage.set_meta("k", "43")
+    assert storage.get_meta("k") == "43"
+    storage.clear_meta("k")
+    assert storage.get_meta("k") is None
+
+
+def test_a_multi_chunk_status_is_not_editable(settings):
+    """editMessageText cannot span chunks, so a long text must not claim an id."""
+    import dataclasses
+
+    client = TelegramClient(dataclasses.replace(settings, dry_run=True))
+    ok, message_id = client.send_and_get_id("x" * 9000, silent=True)
+    assert ok is True and message_id is None
