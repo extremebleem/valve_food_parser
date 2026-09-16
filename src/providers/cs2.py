@@ -253,13 +253,19 @@ class CS2ServerStatusProvider(WatchProvider):
 
         services = result.get("services") if isinstance(result.get("services"), dict) else {}
         if services:
+            # Report the state, do not grade it. Valve returns IEconItems=offline
+            # and Leaderboards=idle as steady values, so calling everything that
+            # is not "normal" a problem would make the label permanently wrong.
+            # The change itself is the signal; the message diffs old against new.
             state = ",".join("{}={}".format(k, services[k]) for k in sorted(services))
-            degraded = [k for k, v in services.items() if str(v).lower() != "normal"]
             values.append(
                 WatchValue(
-                    subject_id=subject.id, key="cs2_services", value=state,
-                    label=("проблемы: " + ", ".join(sorted(degraded))) if degraded else "сервисы в норме",
-                    url=subject.url, observed_at=now,
+                    subject_id=subject.id,
+                    key="cs2_services",
+                    value=state,
+                    label="; ".join("{}: {}".format(k, services[k]) for k in sorted(services)),
+                    url=subject.url,
+                    observed_at=now,
                 )
             )
 
@@ -304,6 +310,11 @@ class SteamPlayerCountProvider(WatchProvider):
                 PLAYERS_URL, params={"appid": subject.external_id}, cache_ttl=0
             )
         except HttpError as exc:
+            # Not every app publishes a concurrent-player counter -- Deadlock
+            # answers 404. That is "no data", not a failure.
+            if exc.status == 404:
+                log.debug("no player counter for this app", extra={"subject": subject.name})
+                return []
             raise ProviderError("player count failed for {}: {}".format(subject.name, exc)) from exc
 
         response = payload.get("response") if isinstance(payload, dict) else None

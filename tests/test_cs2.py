@@ -165,22 +165,32 @@ def test_cs2_status_extracts_every_signal(settings, monkeypatch):
     assert values["cs2_scheduler"].value == "normal"
     assert values["cs2_online_players"].value == "900000"
     assert values["cs2_search_seconds_avg"].value == "40"
-    assert "в норме" in values["cs2_services"].label
+    assert "SessionsLogon: normal" in values["cs2_services"].label
 
 
-def test_cs2_status_names_the_degraded_service(settings, monkeypatch):
+def test_cs2_status_reports_service_state_without_grading_it(settings, monkeypatch):
+    """Valve returns IEconItems=offline and Leaderboards=idle as steady values.
+    Calling everything that is not "normal" a problem made the label
+    permanently wrong -- observed on the first live run."""
     monkeypatch.setenv("STEAM_WEB_API_KEY", "abc")
     provider = CS2ServerStatusProvider(settings)
-    broken = {
+    live = {
         "result": dict(
             STATUS_PAYLOAD["result"],
-            services={"SessionsLogon": "delayed", "IEconItems": "normal"},
+            services={
+                "IEconItems": "offline",
+                "Leaderboards": "idle",
+                "SessionsLogon": "normal",
+                "SteamCommunity": "normal",
+            },
         )
     }
-    monkeypatch.setattr(provider.client, "get_json", lambda *a, **k: broken)
-    values = {v.key: v for v in provider.read(cs2())}
-    assert "SessionsLogon" in values["cs2_services"].label
-    assert "проблемы" in values["cs2_services"].label
+    monkeypatch.setattr(provider.client, "get_json", lambda *a, **k: live)
+    services = {v.key: v for v in provider.read(cs2())}["cs2_services"]
+    assert "проблем" not in services.label.lower()
+    assert "IEconItems: offline" in services.label
+    # the stored value must be complete and stable in ordering
+    assert services.value.startswith("IEconItems=offline,Leaderboards=idle,")
 
 
 def test_cs2_status_explains_a_rejected_key(settings, monkeypatch):
@@ -257,8 +267,10 @@ def test_every_cs2_signal_is_classified():
         ("gc_deploy_in_flight", "yes", "no", "завершилась"),
         ("cs2_scheduler", "normal", "delayed", "delayed"),
         ("cs2_scheduler", "delayed", "normal", "вернулся в норму"),
-        ("cs2_services", "a=normal", "a=delayed", "проблемы"),
-        ("cs2_services", "a=delayed", "a=normal", "вернулись в норму"),
+        # the services title stays neutral: which service moved is in the body,
+        # because "not normal" is a steady state for some of them
+        ("cs2_services", "a=normal", "a=delayed", "сменили состояние"),
+        ("cs2_services", "a=delayed", "a=normal", "сменили состояние"),
     ],
 )
 def test_title_depends_on_the_new_value(settings, storage, key, old, new, expected):
@@ -275,3 +287,64 @@ def test_a_finished_rollout_does_not_advertise_lead_time(settings, storage):
     started = WatchEvent(Subject.steam_app(1422450, "Deadlock"), "gc_deploy_in_flight", "no", "yes")
     assert "типичная фора" not in "\n".join(notifier.render_event(done))
     assert "типичная фора" in "\n".join(notifier.render_event(started))
+
+
+def test_a_missing_player_counter_is_not_a_failure(settings, monkeypatch):
+    """Deadlock answers 404 for GetNumberOfCurrentPlayers -- observed live."""
+    from src.http import HttpError
+
+    provider = SteamPlayerCountProvider(settings)
+
+    def not_found(*a, **k):
+        raise HttpError("missing", 404)
+
+    monkeypatch.setattr(provider.client, "get_json", not_found)
+    assert provider.read(Subject.steam_app(1422450, "Deadlock", meta={"watch_players": True})) == []
+
+
+def test_a_real_player_counter_failure_still_raises(settings, monkeypatch):
+    from src.http import HttpError
+    from src.providers.base import ProviderError
+
+    provider = SteamPlayerCountProvider(settings)
+
+    def boom(*a, **k):
+        raise HttpError("server error", 500)
+
+    monkeypatch.setattr(provider.client, "get_json", boom)
+    with pytest.raises(ProviderError):
+        provider.read(cs2())
+
+
+def test_service_change_lists_only_what_moved(settings, storage):
+    notifier = WatchNotifier(settings, storage, client=RecordingClient())
+    old = "IEconItems=offline,Leaderboards=idle,SessionsLogon=normal"
+    new = "IEconItems=offline,Leaderboards=idle,SessionsLogon=delayed"
+    assert notifier.service_changes(old, new) == ["SessionsLogon: normal → delayed"]
+
+
+def test_service_change_handles_added_and_removed_services(settings, storage):
+    notifier = WatchNotifier(settings, storage, client=RecordingClient())
+    changes = notifier.service_changes("A=normal", "B=normal")
+    assert changes == ["A: normal → —", "B: — → normal"]
+
+
+@pytest.mark.parametrize("old,new", [("", ""), ("garbage", "garbage"), ("A=normal", "A=normal")])
+def test_service_change_is_empty_when_nothing_moved(settings, storage, old, new):
+    notifier = WatchNotifier(settings, storage, client=RecordingClient())
+    assert notifier.service_changes(old, new) == []
+
+
+def test_service_event_message_shows_the_diff_not_the_whole_state(settings, storage):
+    notifier = WatchNotifier(settings, storage, client=RecordingClient())
+    event = WatchEvent(
+        Subject.steam_app(730, "CS2"),
+        "cs2_services",
+        "IEconItems=offline,SessionsLogon=normal",
+        "IEconItems=offline,SessionsLogon=delayed",
+        label="IEconItems: offline; SessionsLogon: delayed",
+    )
+    text = "\n".join(notifier.render_event(event))
+    assert "SessionsLogon: normal → delayed" in text
+    # the unchanged service must not be repeated as if it were news
+    assert "IEconItems: offline; SessionsLogon" not in text

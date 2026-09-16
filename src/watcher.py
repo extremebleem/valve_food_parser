@@ -151,7 +151,7 @@ class Watcher:
             # watched key on the very first run.
             log.info(
                 "watch baseline established",
-                extra={"subject": subject.name, "key": value.key, "value": value.value[:60]},
+                extra={"subject": subject.name, "key": value.key, "value": value.value[:160]},
             )
             return WatchEvent(
                 subject=subject,

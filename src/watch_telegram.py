@@ -94,15 +94,33 @@ class WatchNotifier:
                 else "🎯 Матчмейкинг CS2: {}".format(value)
             )
         if event.key == "cs2_services":
-            degraded = [
-                part for part in value.split(",") if part and not part.endswith("=normal")
-            ]
-            return (
-                "🛠 Сервисы CS2 вернулись в норму"
-                if not degraded
-                else "🛠 Сервисы CS2: проблемы"
-            )
+            return "🛠 Сервисы CS2 сменили состояние"
         return KEY_TITLES.get(event.key, "🔔 Изменение")
+
+    @staticmethod
+    def parse_services(text: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for part in str(text).split(","):
+            if "=" in part:
+                key, _, val = part.partition("=")
+                out[key.strip()] = val.strip()
+        return out
+
+    @classmethod
+    def service_changes(cls, old: str, new: str) -> List[str]:
+        """Only the services that actually moved.
+
+        Valve reports IEconItems=offline and Leaderboards=idle as steady
+        states, so listing everything that is not "normal" would repeat the
+        same non-news every time.
+        """
+        before, after = cls.parse_services(old), cls.parse_services(new)
+        changed = []
+        for key in sorted(set(before) | set(after)):
+            was, now = before.get(key, "—"), after.get(key, "—")
+            if was != now:
+                changed.append("{}: {} → {}".format(key, was, now))
+        return changed
 
     def render_event(self, event: WatchEvent) -> List[str]:
         lines = [
@@ -113,7 +131,10 @@ class WatchNotifier:
             lines.append("<i>{}</i>".format(self.esc(event.label)))
         if event.key in ("required_version", "cs2_app_version", "gc_active_version"):
             lines.append("<code>{} → {}</code>".format(self.esc(event.old_value), self.esc(event.new_value)))
-        if event.detail:
+        if event.key == "cs2_services":
+            changed = self.service_changes(event.old_value, event.new_value)
+            lines.extend("<code>{}</code>".format(self.esc(c)) for c in changed[:8])
+        elif event.detail:
             lines.append(self.esc(event.detail))
         lead = LEAD_TIME.get(event.key)
         if lead and not (event.key == "gc_deploy_in_flight" and event.new_value != "yes"):
