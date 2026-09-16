@@ -71,7 +71,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     metric_type       TEXT NOT NULL,
     sent_at           TIMESTAMPTZ NOT NULL,
     message_hash      TEXT NOT NULL DEFAULT '',
-    delivered         BOOLEAN NOT NULL DEFAULT TRUE
+    delivered         BOOLEAN NOT NULL DEFAULT TRUE,
+    -- 'high' = unusually busy, 'low' = unusually quiet
+    direction         TEXT NOT NULL DEFAULT 'high'
 );
 
 CREATE INDEX IF NOT EXISTS alerts_venue_idx ON alerts (venue_id, kind, sent_at DESC);
@@ -85,8 +87,12 @@ CREATE TABLE IF NOT EXISTS alert_state (
     last_score     DOUBLE PRECISION DEFAULT 0,
     last_deviation DOUBLE PRECISION DEFAULT 0,
     peak_score     DOUBLE PRECISION DEFAULT 0,
+    direction      TEXT NOT NULL DEFAULT 'high',
     updated_at     TIMESTAMPTZ
 );
+
+ALTER TABLE alerts      ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'high';
+ALTER TABLE alert_state ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'high';
 
 CREATE TABLE IF NOT EXISTS runs (
     id          BIGSERIAL PRIMARY KEY,

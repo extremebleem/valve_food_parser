@@ -98,6 +98,20 @@ class AlertKind(str, Enum):
     RECOVERY = "recovery"
 
 
+class Direction(str, Enum):
+    """Which way an observation deviates from its own baseline.
+
+    ``HIGH`` is the classic "unusually busy". ``LOW`` matters because the
+    hypothesis this project was built around -- office workers staying in and
+    ordering delivery instead of walking to a restaurant -- predicts *fewer*
+    people in the nearby venues, not more.
+    """
+
+    NONE = "none"
+    HIGH = "high"
+    LOW = "low"
+
+
 def band_for_score(score: float) -> LoadBand:
     if score <= 30:
         return LoadBand.LOW
@@ -279,6 +293,15 @@ class AnomalyResult:
     robust_z: float = 0.0
     status: BaselineStatus = BaselineStatus.NO_DATA
     reason: str = ""
+    direction: Direction = Direction.NONE
+    #: district-wide ratio this venue was compared against (1.0 = district normal)
+    district_index: float = 1.0
+    #: deviation_ratio after dividing out the district trend
+    relative_ratio: float = 1.0
+
+    @property
+    def relative_percent(self) -> float:
+        return (self.relative_ratio - 1.0) * 100.0
 
     @property
     def current_score(self) -> float:
@@ -300,6 +323,7 @@ class AlertRecord:
     sent_at: Optional[datetime] = None
     message_hash: str = ""
     delivered: bool = True
+    direction: str = "high"
     id: Optional[int] = None
 
 
@@ -312,7 +336,9 @@ class RunStats:
     venues_learning: int = 0
     observations_written: int = 0
     anomalies: int = 0
+    anomalies_low: int = 0
     recoveries: int = 0
+    district_index: float = 1.0
     alerts_sent: int = 0
     alerts_suppressed: int = 0
     provider_errors: Dict[str, int] = field(default_factory=dict)
@@ -322,7 +348,8 @@ class RunStats:
     def as_logline(self) -> str:
         return (
             "venues_total={} venues_open={} venues_checked={} venues_failed={} "
-            "venues_learning={} observations={} anomalies={} recoveries={} "
+            "venues_learning={} observations={} anomalies_high={} anomalies_low={} "
+            "recoveries={} district_index={:.2f} "
             "alerts_sent={} alerts_suppressed={} duration={:.1f}s".format(
                 self.venues_total,
                 self.venues_open,
@@ -331,7 +358,9 @@ class RunStats:
                 self.venues_learning,
                 self.observations_written,
                 self.anomalies,
+                self.anomalies_low,
                 self.recoveries,
+                self.district_index,
                 self.alerts_sent,
                 self.alerts_suppressed,
                 self.duration_seconds,

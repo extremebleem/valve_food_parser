@@ -6,13 +6,30 @@ import dataclasses
 
 import pytest
 
-from src.models import AnomalyResult, Baseline, BaselineStatus, MetricType, Venue
-from src.telegram import MessageBuilder, Notifier, TelegramClient, plural_ru, split_message
+from src.models import (
+    AnomalyResult,
+    Baseline,
+    BaselineStatus,
+    Direction,
+    MetricType,
+    Venue,
+    utcnow,
+)
+from src.telegram import (
+    AlertGate,
+    MessageBuilder,
+    Notifier,
+    TelegramClient,
+    message_hash,
+    plural_ru,
+    split_message,
+)
 
 from .conftest import make_observation
 
 
-def build_result(venue, score, baseline_median, *, samples=20, metric=None, anomaly=True):
+def build_result(venue, score, baseline_median, *, samples=20, metric=None, anomaly=True,
+                 direction=None, district=1.0):
     baseline = (
         Baseline(venue.id, metric or "live_busyness_index", 2, 760, samples, baseline_median, 2.0,
                  baseline_median + 5, baseline_median, BaselineStatus.OK)
@@ -26,6 +43,8 @@ def build_result(venue, score, baseline_median, *, samples=20, metric=None, anom
         metric_value=score if metric is None else 55,
     )
     ratio = score / baseline_median if baseline_median else 1.0
+    if direction is None:
+        direction = Direction.HIGH if anomaly else Direction.NONE
     return AnomalyResult(
         venue=venue,
         observation=observation,
@@ -33,8 +52,11 @@ def build_result(venue, score, baseline_median, *, samples=20, metric=None, anom
         is_anomaly=anomaly,
         deviation_ratio=ratio,
         deviation_percent=(ratio - 1) * 100,
-        robust_z=8.0,
+        robust_z=-8.0 if direction is Direction.LOW else 8.0,
         status=BaselineStatus.OK if samples else BaselineStatus.NO_DATA,
+        direction=direction,
+        district_index=district,
+        relative_ratio=round(ratio / district, 3) if district else ratio,
     )
 
 
@@ -80,7 +102,7 @@ def test_aggregate_message_lists_venues_by_deviation(settings):
         build_result(Venue(id="c", name="Restaurant C", distance_meters=300), 74, 50),
     ]
     text = MessageBuilder(settings).aggregate(results)
-    assert "Повышенная загрузка рядом с" in text
+    assert "Необычная активность рядом с" in text
     assert text.index("Restaurant A") < text.index("Restaurant B") < text.index("Restaurant C")
     assert "1. Restaurant A" in text and "+72%" in text
     assert "3 заведения" in text
@@ -96,7 +118,7 @@ def test_html_is_escaped_in_venue_names(settings):
 
 def test_recovery_message(settings, venue):
     text = MessageBuilder(settings).recovery(build_result(venue, 58, 50, anomaly=False), peak_score=91)
-    assert "Загрузка нормализовалась" in text
+    assert "Загрузка вернулась к норме" in text
     assert "Было: 91/100" in text
     assert "Сейчас: 58/100" in text
 
@@ -198,5 +220,99 @@ def test_notifier_sends_a_recovery_after_an_anomaly(settings, storage, venue):
 
     outcome = notifier.process([build_result(venue, 52, 50, anomaly=False)])
     assert outcome["recoveries_sent"] == 1
-    assert "нормализовалась" in client.messages[0]
+    assert "вернулась к норме" in client.messages[0]
     assert storage.alert_state(venue.id)["active"] is False
+
+
+# --------------------------------------------------------------------------- #
+# unusually quiet + district index
+# --------------------------------------------------------------------------- #
+
+
+def test_quiet_message_states_the_drop_without_claiming_a_cause(settings, venue):
+    result = build_result(venue, 24, 62, direction=Direction.LOW)
+    text = MessageBuilder(settings).anomaly(result)
+    assert "Необычно низкая загрузка" in text
+    assert "61% ниже обычного" in text
+    assert "24/100" in text
+    assert "наблюдение, а не вывод" in text
+    # must not assert a cause it cannot know
+    for forbidden in ("кранч", "crunch", "заказывают", "доставк"):
+        assert forbidden not in text.lower()
+
+
+def test_message_says_whether_the_district_moved_too(settings, venue):
+    local = MessageBuilder(settings).anomaly(build_result(venue, 24, 62, direction=Direction.LOW))
+    assert "Район в целом в норме" in local
+
+    district_wide = MessageBuilder(settings).anomaly(
+        build_result(venue, 24, 62, direction=Direction.LOW, district=0.55)
+    )
+    assert "Район: -45%" in district_wide
+    assert "Район в целом в норме" not in district_wide
+
+
+def test_aggregate_splits_the_two_directions(settings):
+    results = [
+        build_result(Venue(id="a", name="Busy A", distance_meters=100), 86, 50),
+        build_result(Venue(id="b", name="Quiet B", distance_meters=20), 20, 60, direction=Direction.LOW),
+        build_result(Venue(id="c", name="Quiet C", distance_meters=30), 28, 62, direction=Direction.LOW),
+    ]
+    text = MessageBuilder(settings).aggregate(results)
+    assert "Выше обычного" in text and "Ниже обычного" in text
+    assert text.index("Busy A") < text.index("Quiet B")
+    assert "3 заведения" in text
+    # steepest drop first within its section
+    assert text.index("Quiet B") < text.index("Quiet C")
+
+
+def test_aggregate_with_only_drops_has_no_empty_section(settings):
+    results = [
+        build_result(Venue(id="b", name="Quiet B", distance_meters=20), 20, 60, direction=Direction.LOW)
+    ]
+    text = MessageBuilder(settings).aggregate(results)
+    assert "Ниже обычного" in text
+    assert "Выше обычного" not in text
+    assert "1 заведение" in text
+
+
+def test_a_flip_from_busy_to_quiet_is_a_new_alert_not_a_repeat(storage, venue, settings):
+    from src.config import AlertConfig
+
+    gate = AlertGate(storage, AlertConfig(cooldown_minutes=120))
+    storage.set_alert_state(
+        venue.id, active=True, last_alert_at=utcnow(), last_score=88, direction="high"
+    )
+    decision = gate.decide(build_result(venue, 22, 60, direction=Direction.LOW))
+    assert decision.should_send is True
+    assert "direction flipped" in decision.reason
+
+
+def test_a_deepening_drop_escalates(storage, venue, settings):
+    from src.config import AlertConfig
+
+    gate = AlertGate(storage, AlertConfig(cooldown_minutes=120, escalation_delta=15.0))
+    storage.set_alert_state(
+        venue.id, active=True, last_alert_at=utcnow(), last_score=40, direction="low"
+    )
+    # 40 -> 20 is a 20-point deepening, past the 15-point escalation threshold
+    assert gate.decide(build_result(venue, 20, 62, direction=Direction.LOW)).should_send is True
+    # 40 -> 35 is not
+    assert gate.decide(build_result(venue, 35, 62, direction=Direction.LOW)).should_send is False
+
+
+def test_recovery_from_a_drop_means_coming_back_up(storage, venue, settings):
+    from src.config import AlertConfig
+
+    gate = AlertGate(storage, AlertConfig(send_recovery=True, recovery_ratio=1.15))
+    storage.set_alert_state(
+        venue.id, active=True, last_alert_at=utcnow(), last_score=22, peak_score=22, direction="low"
+    )
+    still_low = build_result(venue, 30, 62, anomaly=False, direction=Direction.NONE)
+    assert gate.decide_recovery(still_low).should_send is False
+    back_up = build_result(venue, 58, 62, anomaly=False, direction=Direction.NONE)
+    assert gate.decide_recovery(back_up).should_send is True
+
+
+def test_message_hash_separates_directions():
+    assert message_hash("v", "anomaly", 40, 60, "high") != message_hash("v", "anomaly", 40, 60, "low")

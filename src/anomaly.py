@@ -21,6 +21,7 @@ from .models import (
     AnomalyResult,
     Baseline,
     BaselineStatus,
+    Direction,
     Observation,
     Venue,
     utcnow,
@@ -130,20 +131,57 @@ def compute_baseline(
     )
 
 
-class AnomalyDetector:
-    """Decides whether an observation is unusually high for that venue and slot.
+def district_index(
+    ratios: Sequence[float], min_venues: int = 10
+) -> Optional[float]:
+    """How the whole search radius is behaving right now, as one number.
 
-    All of the following must hold for an anomaly:
+    Each element is a venue's ``current / baseline`` ratio for this run. The
+    median of those is the district trend: 1.0 means "the area is behaving
+    normally", 0.7 means "everything is a third quieter than usual".
+
+    Dividing a venue's own ratio by this cancels the confounders that move every
+    venue at once -- rain, a public holiday, a city-wide event, a panel-data
+    artefact -- which would otherwise fire an alert on all 150 venues
+    simultaneously and mean nothing.
+
+    Returns ``None`` when too few venues have a usable baseline to trust it, in
+    which case the caller falls back to the raw ratio.
+    """
+    values = [float(r) for r in ratios if r is not None and r > 0]
+    if len(values) < max(1, min_venues):
+        return None
+    return round(median(values), 4)
+
+
+class AnomalyDetector:
+    """Decides whether an observation deviates from that venue's own baseline.
+
+    Deviation is detected in **both** directions.
+
+    ``HIGH`` -- unusually busy. All of these must hold:
 
     1. the baseline is usable (``>= MIN_BASELINE_SAMPLES`` samples);
-    2. ``current >= baseline_median * ANOMALY_MULTIPLIER``;
-    3. ``current - baseline_median >= ANOMALY_MIN_ABSOLUTE_DELTA``
+    2. ``relative_ratio >= ANOMALY_MULTIPLIER``;
+    3. ``current - median >= ANOMALY_MIN_ABSOLUTE_DELTA``
        (kills "+80%" jumps from 5 to 9 on the 0-100 scale);
-    4. ``current >= ANOMALY_MIN_SCORE`` (a busy-for-itself venue that is still
-       objectively quiet is not interesting);
-    5. the robust z-score clears ``ANOMALY_MIN_ROBUST_Z`` when the spread is
-       measurable (skipped when MAD == 0, which happens with very flat history);
+    4. ``current >= ANOMALY_MIN_SCORE`` (busy-for-itself but objectively quiet
+       is not interesting);
+    5. robust z clears ``ANOMALY_MIN_ROBUST_Z`` when the spread is measurable;
     6. the signal is confident enough (``ANOMALY_MIN_CONFIDENCE``).
+
+    ``LOW`` -- unusually quiet, which is the signal an office crunch produces
+    nearby (people order in instead of walking over):
+
+    1. ``relative_ratio <= DROP_MULTIPLIER``;
+    2. ``median - current >= DROP_MIN_ABSOLUTE_DELTA``;
+    3. ``median >= DROP_MIN_BASELINE`` -- a venue that is normally quiet cannot
+       drop meaningfully;
+    4. robust z clears ``-DROP_MIN_ROBUST_Z``;
+    5. same confidence gate.
+
+    ``relative_ratio`` is ``current / median`` divided by the district index, so
+    a district-wide move does not count as a per-venue anomaly.
     """
 
     def __init__(self, config: Optional[AnomalyConfig] = None) -> None:
@@ -154,88 +192,164 @@ class AnomalyDetector:
         venue: Venue,
         observation: Observation,
         baseline: Optional[Baseline],
+        district: Optional[float] = None,
     ) -> AnomalyResult:
         cfg = self.config
         current = float(observation.load_score)
+        index = self._district_factor(district)
 
         if baseline is None or baseline.status is BaselineStatus.NO_DATA:
+            fallback = self._absolute_fallback(observation)
             return AnomalyResult(
                 venue=venue,
                 observation=observation,
                 baseline=baseline,
-                is_anomaly=self._absolute_fallback(observation),
+                is_anomaly=fallback,
                 deviation_ratio=1.0,
                 deviation_percent=0.0,
                 robust_z=0.0,
                 status=BaselineStatus.NO_DATA,
                 reason="no historical samples for this slot",
+                direction=Direction.HIGH if fallback else Direction.NONE,
+                district_index=index,
+                relative_ratio=1.0,
             )
 
+        ratio = self._ratio(current, baseline.median)
+        relative = ratio / index if index > 0 else ratio
+
         if baseline.status is BaselineStatus.LEARNING:
+            fallback = self._absolute_fallback(observation)
             return AnomalyResult(
                 venue=venue,
                 observation=observation,
                 baseline=baseline,
-                is_anomaly=self._absolute_fallback(observation),
-                deviation_ratio=self._ratio(current, baseline.median),
+                is_anomaly=fallback,
+                deviation_ratio=round(ratio, 3),
                 deviation_percent=self._percent(current, baseline.median),
                 robust_z=robust_z(current, baseline.median, baseline.mad),
                 status=BaselineStatus.LEARNING,
                 reason="learning baseline ({}/{} samples)".format(
                     baseline.sample_count, cfg.min_baseline_samples
                 ),
+                direction=Direction.HIGH if fallback else Direction.NONE,
+                district_index=index,
+                relative_ratio=round(relative, 3),
             )
 
-        ratio = self._ratio(current, baseline.median)
-        percent = self._percent(current, baseline.median)
         z_score = robust_z(current, baseline.median, baseline.mad)
-        delta = current - baseline.median
         confidence = float(observation.confidence or 0.0)
+        spread_measurable = cfg.require_robust_z and baseline.mad > 0
 
+        high_failures = self._high_failures(
+            current, baseline, relative, z_score, confidence, spread_measurable
+        )
+        low_failures = (
+            self._low_failures(current, baseline, relative, z_score, confidence, spread_measurable)
+            if cfg.detect_drops
+            else ["drop detection disabled"]
+        )
+
+        if not high_failures:
+            direction, reason = Direction.HIGH, "unusually busy"
+        elif not low_failures:
+            direction, reason = Direction.LOW, "unusually quiet"
+        else:
+            direction = Direction.NONE
+            # report the side the venue was actually leaning towards
+            reason = "; ".join(low_failures if relative < 1.0 else high_failures)
+
+        return AnomalyResult(
+            venue=venue,
+            observation=observation,
+            baseline=baseline,
+            is_anomaly=direction is not Direction.NONE,
+            deviation_ratio=round(ratio, 3),
+            deviation_percent=round(self._percent(current, baseline.median), 1),
+            robust_z=round(z_score, 2),
+            status=BaselineStatus.OK,
+            reason=reason,
+            direction=direction,
+            district_index=index,
+            relative_ratio=round(relative, 3),
+        )
+
+    def _district_factor(self, district: Optional[float]) -> float:
+        if not self.config.use_district_index:
+            return 1.0
+        if district is None or district <= 0:
+            return 1.0
+        return float(district)
+
+    def _high_failures(self, current, baseline, relative, z_score, confidence, spread_measurable):
+        cfg = self.config
+        delta = current - baseline.median
         checks = [
-            (ratio >= cfg.multiplier, "ratio {:.2f} < {:.2f}".format(ratio, cfg.multiplier)),
+            (relative >= cfg.multiplier, "ratio {:.2f} < {:.2f}".format(relative, cfg.multiplier)),
             (
                 delta >= cfg.min_absolute_delta,
                 "absolute delta {:.1f} < {:.1f}".format(delta, cfg.min_absolute_delta),
             ),
+            (current >= cfg.min_score, "score {:.1f} < floor {:.1f}".format(current, cfg.min_score)),
             (
-                current >= cfg.min_score,
-                "score {:.1f} < floor {:.1f}".format(current, cfg.min_score),
+                confidence >= cfg.min_confidence,
+                "confidence {:.2f} < {:.2f}".format(confidence, cfg.min_confidence),
+            ),
+        ]
+        if spread_measurable:
+            checks.append(
+                (z_score >= cfg.min_robust_z, "robust z {:.2f} < {:.2f}".format(z_score, cfg.min_robust_z))
+            )
+        return [why for ok, why in checks if not ok]
+
+    def _low_failures(self, current, baseline, relative, z_score, confidence, spread_measurable):
+        cfg = self.config
+        drop = baseline.median - current
+        checks = [
+            (
+                relative <= cfg.drop_multiplier,
+                "ratio {:.2f} > {:.2f}".format(relative, cfg.drop_multiplier),
+            ),
+            (
+                drop >= cfg.drop_min_absolute_delta,
+                "drop {:.1f} < {:.1f}".format(drop, cfg.drop_min_absolute_delta),
+            ),
+            (
+                baseline.median >= cfg.drop_min_baseline,
+                "baseline {:.1f} < floor {:.1f}".format(baseline.median, cfg.drop_min_baseline),
             ),
             (
                 confidence >= cfg.min_confidence,
                 "confidence {:.2f} < {:.2f}".format(confidence, cfg.min_confidence),
             ),
         ]
-        if cfg.require_robust_z and baseline.mad > 0:
+        if spread_measurable:
             checks.append(
                 (
-                    z_score >= cfg.min_robust_z,
-                    "robust z {:.2f} < {:.2f}".format(z_score, cfg.min_robust_z),
+                    z_score <= -cfg.drop_min_robust_z,
+                    "robust z {:.2f} > -{:.2f}".format(z_score, cfg.drop_min_robust_z),
                 )
             )
+        return [why for ok, why in checks if not ok]
 
-        failures = [why for ok, why in checks if not ok]
-        is_anomaly = not failures
+    def is_recovered(
+        self,
+        observation: Observation,
+        baseline: Optional[Baseline],
+        ratio: float,
+        direction: Direction = Direction.HIGH,
+    ) -> bool:
+        """Has the venue come back to (near) its normal level?
 
-        return AnomalyResult(
-            venue=venue,
-            observation=observation,
-            baseline=baseline,
-            is_anomaly=is_anomaly,
-            deviation_ratio=round(ratio, 3),
-            deviation_percent=round(percent, 1),
-            robust_z=round(z_score, 2),
-            status=BaselineStatus.OK,
-            reason="anomaly" if is_anomaly else "; ".join(failures),
-        )
-
-    def is_recovered(self, observation: Observation, baseline: Optional[Baseline], ratio: float) -> bool:
-        """Has the venue dropped back to (near) its normal level?"""
+        Recovery is direction-aware: a venue that was unusually *busy* recovers
+        by coming down, one that was unusually *quiet* recovers by coming up.
+        """
         if baseline is None or not baseline.usable:
             return False
         if baseline.median <= 0:
             return observation.load_score < self.config.min_score
+        if direction is Direction.LOW:
+            return observation.load_score >= baseline.median / max(ratio, 1e-9)
         return observation.load_score <= baseline.median * ratio
 
     # -- helpers ---------------------------------------------------------- #

@@ -17,12 +17,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import opening_hours as oh
-from .anomaly import AnomalyDetector, compute_baseline
+from .anomaly import AnomalyDetector, compute_baseline, district_index
 from .config import Settings
 from .logging_utils import get_logger, github_summary, set_output
 from .models import (
     AnomalyResult,
+    Baseline,
     BaselineStatus,
+    Direction,
     LoadSignal,
     Observation,
     RunStats,
@@ -254,16 +256,47 @@ class Monitor:
         stats.observations_written = self.storage.insert_observations(observations)
 
         by_id = {venue.id: venue for venue in venues}
+
+        # Pass 1: baselines only. The district index needs every venue's ratio
+        # before any single venue can be judged against it.
+        baselines: Dict[str, Baseline] = {}
+        ratios: List[float] = []
+        for observation in observations:
+            baseline = self.baseline_for(observation)
+            baselines[observation.venue_id] = baseline
+            if baseline.usable and baseline.median > 0:
+                ratios.append(observation.load_score / baseline.median)
+
+        district = (
+            district_index(ratios, self.settings.anomaly.district_min_venues)
+            if self.settings.anomaly.use_district_index
+            else None
+        )
+        stats.district_index = district if district is not None else 1.0
+        log.info(
+            "district index",
+            extra={
+                "index": stats.district_index,
+                "venues_with_baseline": len(ratios),
+                "min_required": self.settings.anomaly.district_min_venues,
+                "applied": district is not None,
+            },
+        )
+
+        # Pass 2: judge each venue against its own baseline and the district.
         for observation in observations:
             venue = by_id.get(observation.venue_id)
             if venue is None:  # pragma: no cover - defensive
                 continue
-            result = self.evaluate(venue, observation)
+            result = self.evaluate(venue, observation, baselines[observation.venue_id], district)
             results.append(result)
             if result.status is not BaselineStatus.OK:
                 stats.venues_learning += 1
             if result.is_anomaly:
-                stats.anomalies += 1
+                if result.direction is Direction.LOW:
+                    stats.anomalies_low += 1
+                else:
+                    stats.anomalies += 1
             else:
                 mark_state_from_observation(self.storage, result)
 
@@ -276,9 +309,10 @@ class Monitor:
         self._report(stats, counters, outcome, results, started)
         return stats
 
-    def evaluate(self, venue: Venue, observation: Observation) -> AnomalyResult:
+    def baseline_for(self, observation: Observation) -> Baseline:
+        """Fetch comparable history for this slot, summarise it and persist it."""
         samples = self.storage.fetch_baseline_samples(
-            venue_id=venue.id,
+            venue_id=observation.venue_id,
             metric_type=observation.metric_type,
             weekday=observation.local_weekday,
             minutes=observation.local_minutes,
@@ -287,7 +321,7 @@ class Monitor:
             exclude_after=observation.timestamp,
         )
         baseline = compute_baseline(
-            venue.id,
+            observation.venue_id,
             observation.metric_type,
             observation.local_weekday,
             observation.local_minutes,
@@ -295,7 +329,18 @@ class Monitor:
             self.settings.anomaly,
         )
         self.storage.upsert_baseline(baseline)
-        return self.detector.evaluate(venue, observation, baseline)
+        return baseline
+
+    def evaluate(
+        self,
+        venue: Venue,
+        observation: Observation,
+        baseline: Optional[Baseline] = None,
+        district: Optional[float] = None,
+    ) -> AnomalyResult:
+        if baseline is None:
+            baseline = self.baseline_for(observation)
+        return self.detector.evaluate(venue, observation, baseline, district)
 
     # -- observability ----------------------------------------------------- #
 
@@ -317,6 +362,8 @@ class Monitor:
                 "venues_failed": stats.venues_failed,
                 "venues_learning": stats.venues_learning,
                 "anomalies": stats.anomalies,
+                "anomalies_low": stats.anomalies_low,
+                "district_index": stats.district_index,
                 "alerts_sent": stats.alerts_sent,
                 "alerts_suppressed": stats.alerts_suppressed,
                 "recoveries": stats.recoveries,
@@ -343,24 +390,36 @@ class Monitor:
         set_output("anomalies", str(stats.anomalies))
         set_output("alerts_sent", str(stats.alerts_sent))
 
-        top = sorted(results, key=lambda r: -r.current_score)[:10]
+        top = sorted(results, key=lambda r: -abs(r.relative_percent))[:10]
         lines = [
             "### Restaurant Demand Monitor",
             "",
             "`{}`".format(stats.as_logline()),
             "",
-            "| Venue | Now | Baseline | Deviation | Samples | Anomaly |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "District index: **{:.2f}** (1.00 = the whole radius is behaving normally)".format(
+                stats.district_index
+            ),
+            "",
+            "| Venue | Now | Baseline | Deviation | vs district | Samples | |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
         for result in top:
+            marker = ""
+            if result.direction is Direction.HIGH:
+                marker = "🔥"
+            elif result.direction is Direction.LOW:
+                marker = "📉"
+            elif result.status is not BaselineStatus.OK:
+                marker = "📚"
             lines.append(
-                "| {} | {:.0f} | {} | {:+.0f}% | {} | {} |".format(
+                "| {} | {:.0f} | {} | {:+.0f}% | {:+.0f}% | {} | {} |".format(
                     result.venue.name.replace("|", "/"),
                     result.current_score,
                     "{:.0f}".format(result.baseline.median) if result.baseline else "—",
                     result.deviation_percent,
+                    result.relative_percent,
                     result.baseline.sample_count if result.baseline else 0,
-                    "🔥" if result.is_anomaly else ("📚" if result.status is not BaselineStatus.OK else ""),
+                    marker,
                 )
             )
         if self.settings.dry_run:

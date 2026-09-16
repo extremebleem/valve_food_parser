@@ -70,14 +70,15 @@ CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, venue_id TEXT NOT NULL, kind TEXT NOT NULL,
     load_score REAL NOT NULL, baseline_score REAL NOT NULL, deviation_percent REAL NOT NULL,
     metric_type TEXT NOT NULL, sent_at TEXT NOT NULL, message_hash TEXT NOT NULL DEFAULT '',
-    delivered INTEGER NOT NULL DEFAULT 1
+    delivered INTEGER NOT NULL DEFAULT 1, direction TEXT NOT NULL DEFAULT 'high'
 );
 CREATE INDEX IF NOT EXISTS alerts_venue_idx ON alerts (venue_id, kind, sent_at DESC);
 
 CREATE TABLE IF NOT EXISTS alert_state (
     venue_id TEXT PRIMARY KEY, metric_type TEXT NOT NULL DEFAULT '',
     active INTEGER NOT NULL DEFAULT 0, last_alert_at TEXT, last_score REAL DEFAULT 0,
-    last_deviation REAL DEFAULT 0, peak_score REAL DEFAULT 0, updated_at TEXT
+    last_deviation REAL DEFAULT 0, peak_score REAL DEFAULT 0, updated_at TEXT,
+    direction TEXT NOT NULL DEFAULT 'high'
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -470,7 +471,8 @@ class BaseStorage:
     def record_alert(self, alert: AlertRecord) -> None:
         self.execute(
             "INSERT INTO alerts (venue_id, kind, load_score, baseline_score, deviation_percent, "
-            "metric_type, sent_at, message_hash, delivered) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "metric_type, sent_at, message_hash, delivered, direction) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 alert.venue_id,
                 alert.kind,
@@ -481,6 +483,7 @@ class BaseStorage:
                 self.ts(alert.sent_at or utcnow()),
                 alert.message_hash,
                 self.bool_true if alert.delivered else self.bool_false,
+                alert.direction,
             ),
         )
         self.commit()
@@ -488,7 +491,7 @@ class BaseStorage:
     def last_alert(self, venue_id: str, kind: Optional[str] = None) -> Optional[AlertRecord]:
         sql = (
             "SELECT id, venue_id, kind, load_score, baseline_score, deviation_percent, "
-            "metric_type, sent_at, message_hash, delivered FROM alerts WHERE venue_id = ?"
+            "metric_type, sent_at, message_hash, delivered, direction FROM alerts WHERE venue_id = ?"
         )
         params: List[Any] = [venue_id]
         if kind:
@@ -509,12 +512,13 @@ class BaseStorage:
             sent_at=parse_iso(row[7]),
             message_hash=row[8] or "",
             delivered=bool(row[9]),
+            direction=row[10] or "high",
         )
 
     def alert_state(self, venue_id: str) -> Dict[str, Any]:
         row = self.fetchone(
             "SELECT venue_id, metric_type, active, last_alert_at, last_score, last_deviation, "
-            "peak_score, updated_at FROM alert_state WHERE venue_id = ?",
+            "peak_score, updated_at, direction FROM alert_state WHERE venue_id = ?",
             (venue_id,),
         )
         if not row:
@@ -527,6 +531,7 @@ class BaseStorage:
                 "last_deviation": 0.0,
                 "peak_score": 0.0,
                 "updated_at": None,
+                "direction": "high",
             }
         return {
             "venue_id": row[0],
@@ -537,6 +542,7 @@ class BaseStorage:
             "last_deviation": float(row[5] or 0.0),
             "peak_score": float(row[6] or 0.0),
             "updated_at": parse_iso(row[7]),
+            "direction": row[8] or "high",
         }
 
     def set_alert_state(
@@ -549,11 +555,13 @@ class BaseStorage:
         last_score: float = 0.0,
         last_deviation: float = 0.0,
         peak_score: float = 0.0,
+        direction: str = "high",
     ) -> None:
         self.execute("DELETE FROM alert_state WHERE venue_id = ?", (venue_id,))
         self.execute(
             "INSERT INTO alert_state (venue_id, metric_type, active, last_alert_at, last_score, "
-            "last_deviation, peak_score, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "last_deviation, peak_score, updated_at, direction) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 venue_id,
                 metric_type,
@@ -563,6 +571,7 @@ class BaseStorage:
                 float(last_deviation),
                 float(peak_score),
                 self.ts(utcnow()),
+                direction,
             ),
         )
         self.commit()
@@ -586,6 +595,12 @@ class BaseStorage:
         self.commit()
 
 
+    ADDED_COLUMNS = (
+        ("alerts", "direction", "TEXT NOT NULL DEFAULT 'high'"),
+        ("alert_state", "direction", "TEXT NOT NULL DEFAULT 'high'"),
+    )
+
+
 class SQLiteStorage(BaseStorage):
     placeholder = "?"
 
@@ -604,6 +619,11 @@ class SQLiteStorage(BaseStorage):
 
     def migrate(self) -> None:
         self.conn.executescript(SQLITE_DDL)
+        # bring databases created by an older revision up to date
+        for table, column, definition in self.ADDED_COLUMNS:
+            existing = {row[1] for row in self.fetchall("PRAGMA table_info({})".format(table))}
+            if column not in existing:
+                self.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, column, definition))
         self.conn.commit()
 
 

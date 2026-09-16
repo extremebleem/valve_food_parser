@@ -169,6 +169,23 @@ class AnomalyConfig:
     fallback_absolute_enabled: bool = False
     fallback_absolute_score: float = 90.0
 
+    # -- unusually *quiet* -------------------------------------------------- #
+    # An office in crunch orders delivery instead of walking to a restaurant,
+    # which shows up as fewer people in the nearby venues, not more. Drops are
+    # therefore detected as first-class anomalies.
+    detect_drops: bool = True
+    drop_multiplier: float = 0.6
+    drop_min_absolute_delta: float = 12.0
+    #: a venue that is normally quiet cannot produce a meaningful drop
+    drop_min_baseline: float = 40.0
+    drop_min_robust_z: float = 3.0
+
+    # -- district-relative comparison --------------------------------------- #
+    # Divide out what the whole search radius is doing this run, so rain, a
+    # public holiday or a city-wide event cannot light up every venue at once.
+    use_district_index: bool = True
+    district_min_venues: int = 10
+
 
 @dataclass(frozen=True)
 class ActiveWindowConfig:
@@ -371,6 +388,13 @@ def load_settings(env_file: Optional[str] = ".env", *, run_id: str = "") -> Sett
         min_confidence=env_float("ANOMALY_MIN_CONFIDENCE", 0.4),
         fallback_absolute_enabled=env_bool("ANOMALY_FALLBACK_ABSOLUTE_ENABLED", False),
         fallback_absolute_score=env_float("ANOMALY_FALLBACK_ABSOLUTE_SCORE", 90.0),
+        detect_drops=env_bool("DETECT_DROPS", True),
+        drop_multiplier=env_float("DROP_MULTIPLIER", 0.6),
+        drop_min_absolute_delta=env_float("DROP_MIN_ABSOLUTE_DELTA", 12.0),
+        drop_min_baseline=env_float("DROP_MIN_BASELINE", 40.0),
+        drop_min_robust_z=env_float("DROP_MIN_ROBUST_Z", 3.0),
+        use_district_index=env_bool("USE_DISTRICT_INDEX", True),
+        district_min_venues=env_int("DISTRICT_MIN_VENUES", 10),
     )
 
     alerts = AlertConfig(

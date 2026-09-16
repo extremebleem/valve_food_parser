@@ -21,9 +21,10 @@
                     │       (same venue/metric/weekday, ±60 min,     │
                     │        last 8 weeks)                           │
                     │    7. compute_baseline  median / MAD / p90     │
-                    │    8. AnomalyDetector   ratio + z + floors     │
-                    │    9. AlertGate         cooldown + dedupe      │
-                    │   10. TelegramClient    aggregated message     │
+                    │    8. district_index over all venues this run  │
+                    │    9. AnomalyDetector   HIGH / LOW vs district │
+                    │   10. AlertGate      cooldown + dedupe + flip  │
+                    │   11. TelegramClient    aggregated message     │
                     └────────────────────┬───────────────────────────┘
                                          │
                             Postgres (Supabase / Neon)
@@ -98,6 +99,27 @@ spread   = MAD(samples)          # 1.4826·MAD ≈ σ for normal data
 
 Median and MAD rather than mean and σ: the events we are trying to *detect* are
 exactly the ones that would poison a mean-based baseline.
+
+#### Two directions
+
+Deviation is detected **both ways**. `HIGH` is the classic "unusually busy".
+`LOW` exists because the hypothesis this project serves — an office in crunch
+ordering delivery instead of walking to a restaurant — predicts *fewer* people
+in the nearby venues, not more. A drop is reported as an observation about the
+venue, never as a conclusion about why.
+
+#### The district index
+
+Before judging any venue, the run computes the median `current / baseline` ratio
+across every venue that has a usable baseline. That one number is what the whole
+search radius is doing right now: `1.0` is normal, `0.7` means the area is a
+third quieter than usual.
+
+Each venue's ratio is then divided by it. This is what separates "this venue is
+behaving oddly" from "it is raining on all of Bellevue" — without it, weather, a
+public holiday or a city-wide event would fire an alert on all 150 venues at
+once and mean nothing. Below `DISTRICT_MIN_VENUES` usable baselines the index is
+not trusted and the raw ratio is used instead.
 
 An anomaly requires **all** of:
 

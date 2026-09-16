@@ -30,14 +30,18 @@ from src.models import (
     make_venue_id,
     utcnow,
 )
+from src.anomaly import district_index
 from src.monitor import Monitor, local_slot, office_timezone
 from src.providers.base import LoadProvider
 from src.storage import create_storage
 
 # (name, category, distance_m, historical mean load, current load)
 SCENARIOS = [
+    # the hypothesis case: venues in Valve's own building go quiet while the
+    # rest of the district carries on as usual
+    ("Lincoln Square South Food Hall", "food_court", 17.0, 62.0, 24.0),
+    ("Mix Sushi Bar", "asian", 14.0, 58.0, 26.0),
     ("Din Tai Fung", "asian", 650.0, 46.0, 78.0),
-    ("Lincoln Square South Food Hall", "food_court", 17.0, 52.0, 88.0),
     ("Blue Bottle Coffee", "coffee", 240.0, 61.0, 64.0),
     ("Monsoon East", "asian", 1180.0, 38.0, 41.0),
     ("Just Opened Ramen", "asian", 430.0, 0.0, 83.0),   # no history at all
@@ -157,7 +161,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             settings, storage, providers=[ReplayProvider(settings, current)]
         )
         venues_now, _ = monitor.select_venues(now)
-        rows = []
+        # same two-pass shape as Monitor.run(): baselines first, then the
+        # district index, then judge each venue against both
+        observations, baselines, ratios = [], {}, []
         for venue in venues_now:
             signal = monitor.collect_signal(venue)[0]
             if signal is None:
@@ -166,20 +172,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             if observation is None:
                 continue
             storage.insert_observations([observation])
-            rows.append(monitor.evaluate(venue, observation))
+            observations.append((venue, observation))
+            baseline = monitor.baseline_for(observation)
+            baselines[observation.venue_id] = baseline
+            if baseline.usable and baseline.median > 0:
+                ratios.append(observation.load_score / baseline.median)
+
+        district = district_index(ratios, min_venues=3)
+        print("district index: {} (1.00 = район ведёт себя нормально; "
+              "по {} заведениям с baseline)".format(district, len(ratios)))
+
+        rows = [
+            monitor.evaluate(venue, observation, baselines[observation.venue_id], district)
+            for venue, observation in observations
+        ]
 
         print()
-        for result in sorted(rows, key=lambda r: -r.current_score):
+        for result in sorted(rows, key=lambda r: -abs(r.relative_percent)):
             print(result.venue.name)
             print("  Current:   {:.0f}".format(result.current_score))
             print("  Baseline:  {}".format(
                 "{:.0f}  (n={}, MAD={:.1f})".format(
                     result.baseline.median, result.baseline.sample_count, result.baseline.mad)
                 if result.baseline and result.baseline.sample_count else "none"))
-            print("  Deviation: {:+.0f}%   robust z: {:.1f}".format(
-                result.deviation_percent, result.robust_z))
-            print("  ANOMALY = {}   [{}]".format(
-                str(result.is_anomaly).upper(), result.reason))
+            print("  Deviation: {:+.0f}%   vs district: {:+.0f}%   robust z: {:.1f}".format(
+                result.deviation_percent, result.relative_percent, result.robust_z))
+            print("  ANOMALY = {:<5}  direction = {:<5}  [{}]".format(
+                str(result.is_anomaly).upper(), result.direction.value, result.reason))
             print()
 
         print("=" * 78)

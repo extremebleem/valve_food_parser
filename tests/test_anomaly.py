@@ -9,13 +9,14 @@ import pytest
 from src.anomaly import (
     AnomalyDetector,
     compute_baseline,
+    district_index,
     median,
     median_absolute_deviation,
     percentile,
     robust_z,
 )
 from src.config import AnomalyConfig
-from src.models import BaselineStatus
+from src.models import BaselineStatus, Direction
 
 from .conftest import make_observation
 
@@ -212,3 +213,133 @@ def test_config_replacement_does_not_leak_between_detectors(venue):
     tuned = dataclasses.replace(base, multiplier=3.0)
     assert base.multiplier == 1.5
     assert tuned.multiplier == 3.0
+
+
+# --------------------------------------------------------------------------- #
+# unusually quiet (drops)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_clear_drop_is_detected(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 24.0), baseline)
+    assert result.is_anomaly is True
+    assert result.direction is Direction.LOW
+    assert result.deviation_percent < -50
+    assert result.robust_z < -3.0
+
+
+def test_drops_can_be_switched_off(venue):
+    detector = AnomalyDetector(AnomalyConfig(detect_drops=False))
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 24.0), baseline)
+    assert result.is_anomaly is False
+    assert result.direction is Direction.NONE
+
+
+def test_a_normally_quiet_venue_cannot_produce_a_meaningful_drop(venue):
+    """From 20 to 5 is -75%, but nobody was there to begin with."""
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [20, 21, 19, 20, 22, 20])
+    result = detector.evaluate(venue, make_observation(venue.id, 5.0), baseline)
+    assert result.is_anomaly is False
+    assert "baseline" in result.reason
+
+
+def test_a_shallow_dip_is_not_a_drop(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 52.0), baseline)
+    assert result.is_anomaly is False
+    assert result.direction is Direction.NONE
+
+
+def test_high_and_low_are_mutually_exclusive(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    for score in range(0, 101, 5):
+        result = detector.evaluate(venue, make_observation(venue.id, float(score)), baseline)
+        assert result.direction in (Direction.NONE, Direction.HIGH, Direction.LOW)
+        if result.direction is Direction.HIGH:
+            assert score > baseline.median
+        if result.direction is Direction.LOW:
+            assert score < baseline.median
+
+
+# --------------------------------------------------------------------------- #
+# district index
+# --------------------------------------------------------------------------- #
+
+
+def test_district_index_is_the_median_ratio():
+    assert district_index([0.5, 1.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]) == 1.0
+    assert district_index([0.7] * 12) == 0.7
+
+
+def test_district_index_needs_enough_venues():
+    assert district_index([0.7, 0.7, 0.7], min_venues=10) is None
+    assert district_index([], min_venues=1) is None
+    assert district_index([0.7, 0.7, 0.7], min_venues=3) == 0.7
+
+
+def test_district_index_ignores_junk_ratios():
+    assert district_index([1.0, 1.0, 1.0, None, 0.0, -1.0, 1.0, 1.0], min_venues=5) == 1.0
+
+
+def test_a_district_wide_slump_is_not_a_per_venue_anomaly(venue):
+    """Rain empties every venue at once. That is weather, not a venue event."""
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    observation = make_observation(venue.id, 30.0)
+
+    alone = detector.evaluate(venue, observation, baseline)
+    assert alone.direction is Direction.LOW
+
+    with_district = detector.evaluate(venue, observation, baseline, district=0.5)
+    assert with_district.direction is Direction.NONE
+    assert with_district.district_index == 0.5
+    assert with_district.relative_ratio == pytest.approx(0.96, abs=0.02)
+
+
+def test_a_venue_dropping_against_a_steady_district_still_alerts(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 24.0), baseline, district=1.02)
+    assert result.direction is Direction.LOW
+
+
+def test_a_district_wide_surge_is_not_a_per_venue_anomaly(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [42, 44, 40, 43, 41, 45, 42, 43])
+    observation = make_observation(venue.id, 70.0)
+    assert detector.evaluate(venue, observation, baseline).direction is Direction.HIGH
+    assert detector.evaluate(venue, observation, baseline, district=1.7).direction is Direction.NONE
+
+
+def test_district_index_can_be_disabled(venue):
+    detector = AnomalyDetector(AnomalyConfig(use_district_index=False))
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 30.0), baseline, district=0.5)
+    assert result.district_index == 1.0
+    assert result.direction is Direction.LOW
+
+
+@pytest.mark.parametrize("bad", [None, 0.0, -1.0])
+def test_an_unusable_district_index_falls_back_to_the_raw_ratio(venue, bad):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [62, 64, 60, 63, 61, 65, 62, 63])
+    result = detector.evaluate(venue, make_observation(venue.id, 24.0), baseline, district=bad)
+    assert result.district_index == 1.0
+    assert result.direction is Direction.LOW
+
+
+def test_recovery_is_direction_aware(venue):
+    detector = AnomalyDetector(AnomalyConfig())
+    baseline = compute_baseline("v1", "m", 2, 760, [60, 61, 59, 60, 62, 60])
+    # was busy -> recovers by coming down
+    assert detector.is_recovered(make_observation(venue.id, 65.0), baseline, 1.15, Direction.HIGH) is True
+    assert detector.is_recovered(make_observation(venue.id, 90.0), baseline, 1.15, Direction.HIGH) is False
+    # was quiet -> recovers by coming back up
+    assert detector.is_recovered(make_observation(venue.id, 55.0), baseline, 1.15, Direction.LOW) is True
+    assert detector.is_recovered(make_observation(venue.id, 25.0), baseline, 1.15, Direction.LOW) is False

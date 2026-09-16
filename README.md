@@ -52,7 +52,8 @@ that is open right now:
 3. store the observation;
 4. build a baseline from the same venue's history for the same weekday and
    roughly the same local time over the last 4–8 weeks;
-5. decide whether the current reading is anomalously high;
+5. compute a **district index** — what the whole search radius is doing this run —
+   and decide whether the venue is anomalously **high or low** against it;
 6. apply cooldown and de-duplication;
 7. send one aggregated Telegram message.
 
@@ -95,7 +96,7 @@ valve-food-monitor/
 │   ├── storage.py          Postgres + SQLite behind one interface
 │   ├── discovery.py        fan-out + cross-source de-duplication
 │   ├── normalization.py    raw metric -> load_score 0..100
-│   ├── anomaly.py          median / MAD / p90 baseline, anomaly gates
+│   ├── anomaly.py          baseline, district index, HIGH/LOW anomaly gates
 │   ├── monitor.py          the 30-minute run
 │   ├── telegram.py         gating, message rendering, Bot API
 │   └── providers/
@@ -291,7 +292,7 @@ All of these must hold:
 
 | Gate | Env var | Default |
 | --- | --- | --- |
-| `ratio ≥ multiplier` | `ANOMALY_MULTIPLIER` | 1.5 |
+| `relative_ratio ≥ multiplier` | `ANOMALY_MULTIPLIER` | 1.5 |
 | `delta ≥ min absolute delta` | `ANOMALY_MIN_ABSOLUTE_DELTA` | 10 |
 | `current ≥ score floor` | `ANOMALY_MIN_SCORE` | 55 |
 | `robust_z ≥ threshold` (skipped when MAD = 0) | `ANOMALY_MIN_ROBUST_Z` | 3.0 |
@@ -301,6 +302,45 @@ All of these must hold:
 The extra gates exist because the headline ratio alone is not enough: a jump from
 4 to 10 is `+150%` and completely uninteresting, and a venue that is busy by its
 own standards while still objectively quiet is not worth a notification.
+
+### Unusually quiet is also an anomaly
+
+The hypothesis this project serves is that an office in crunch **orders delivery
+instead of walking to a restaurant**. That predicts *fewer* people in the nearby
+venues, not more — so a drop is a first-class anomaly, not the absence of one.
+
+| Gate | Env var | Default |
+| --- | --- | --- |
+| `relative_ratio ≤ drop multiplier` | `DROP_MULTIPLIER` | 0.6 |
+| `median − current ≥ min drop` | `DROP_MIN_ABSOLUTE_DELTA` | 12 |
+| `median ≥ baseline floor` | `DROP_MIN_BASELINE` | 40 |
+| `robust_z ≤ −threshold` | `DROP_MIN_ROBUST_Z` | 3.0 |
+
+`DROP_MIN_BASELINE` matters most: a venue that normally sits at 20 dropping to 5
+is `−75%` and means nothing, because nobody was there to begin with. Set
+`DETECT_DROPS=false` to go back to spikes only.
+
+Drop notifications state the observation and stop there. The data cannot
+distinguish "everyone is ordering in" from a dozen other causes, so the message
+says so rather than asserting a reason.
+
+### The district index
+
+Before judging any venue, each run computes the median `current / baseline`
+ratio across every venue that has a usable baseline. That single number is what
+the **whole search radius** is doing right now — `1.0` is normal, `0.7` means the
+area is a third quieter than usual. Every venue's ratio is then divided by it.
+
+This is what separates *"this venue is behaving oddly"* from *"it is raining on
+all of Bellevue"*. Without it, weather, a public holiday or a city-wide event
+would fire an alert on all 150 venues simultaneously and tell you nothing. With
+it, the interesting pattern is the one the hypothesis predicts: **the venues in
+and around Valve's building go quiet while the district carries on**.
+
+Below `DISTRICT_MIN_VENUES` (default 10) usable baselines the index is not
+trusted and the raw ratio is used instead. `USE_DISTRICT_INDEX=false` disables
+it. The index is logged every run and shown in the job summary and in the
+aggregated Telegram message.
 
 ### Active window
 
@@ -333,7 +373,12 @@ it last notified, its last score and its peak. A repeat is sent when:
 * the score climbed by `ALERT_ESCALATION_DELTA` (default 15) — it got worse, **or**
 * the venue recovered and became anomalous again (subject to an
   `ALERT_REARM_MINUTES` floor, default 30, so a venue flapping around the
-  threshold cannot spam the chat).
+  threshold cannot spam the chat), **or**
+* the direction flipped — a venue flagged as unusually busy that is now
+  unusually quiet is a different situation, not a repeat of the same one.
+
+"Worse" is direction-aware: a busy venue getting busier, or a quiet one getting
+quieter. So is recovery — a venue that was quiet recovers by coming back **up**.
 
 `MAX_ALERTS_PER_RUN` caps the worst case. When several venues fire at once a
 single aggregated message is sent.
@@ -410,7 +455,7 @@ This calls `getChat` to prove the id resolves, then sends a real test message.
 ### Variables — *…→ Variables* (non-secret, editable from the UI without a commit)
 
 `OFFICE_NAME` · `OFFICE_ADDRESS` · `OFFICE_LAT` · `OFFICE_LON` ·
-`OFFICE_TIMEZONE` · `SEARCH_RADIUS_METERS` · `ANOMALY_MULTIPLIER` ·
+`OFFICE_TIMEZONE` · `SEARCH_RADIUS_METERS` · `ANOMALY_MULTIPLIER` · `DETECT_DROPS` · `DROP_MULTIPLIER` · `USE_DISTRICT_INDEX` ·
 `MIN_BASELINE_SAMPLES` · `BASELINE_LOOKBACK_WEEKS` · `BASELINE_WINDOW_MINUTES` ·
 `ALERT_COOLDOWN_MINUTES` · `SEND_RECOVERY_ALERTS` · `MAX_VENUES_PER_RUN` ·
 `ENABLE_GOOGLE_DISCOVERY` · `ENABLE_FOURSQUARE_DISCOVERY` · `VENUE_STALE_DAYS` ·

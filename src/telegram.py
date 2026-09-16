@@ -24,6 +24,7 @@ from .models import (
     AlertRecord,
     AnomalyResult,
     BaselineStatus,
+    Direction,
     band_for_score,
     utcnow,
 )
@@ -48,7 +49,9 @@ def plural_ru(count: int, one: str, few: str, many: str) -> str:
     return many
 
 
-def message_hash(venue_id: str, kind: str, score: float, baseline: float) -> str:
+def message_hash(
+    venue_id: str, kind: str, score: float, baseline: float, direction: str = "high"
+) -> str:
     """Content fingerprint used to suppress repeats that say the same thing.
 
     Scores are floored into 5-point bins, so a small wobble inside a bin
@@ -56,7 +59,7 @@ def message_hash(venue_id: str, kind: str, score: float, baseline: float) -> str
     in :class:`AlertGate` is what actually bounds the notification rate, because
     two scores either side of a bin edge still hash differently.
     """
-    key = "{}|{}|{:.0f}|{:.0f}".format(venue_id, kind, score // 5, baseline // 5)
+    key = "{}|{}|{}|{:.0f}|{:.0f}".format(venue_id, kind, direction, score // 5, baseline // 5)
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
 
 
@@ -66,6 +69,7 @@ class AlertDecision:
     reason: str
     kind: str = AlertKind.ANOMALY.value
     escalated: bool = False
+    direction: str = Direction.HIGH.value
 
 
 class AlertGate:
@@ -100,30 +104,55 @@ class AlertGate:
             return AlertDecision(False, "not an anomaly")
 
         current = result.current_score
-        fingerprint = message_hash(venue_id, AlertKind.ANOMALY.value, current, result.baseline_score)
+        # an anomaly always has a direction; fall back to the classic high case
+        direction = (
+            result.direction.value if result.direction is not Direction.NONE else Direction.HIGH.value
+        )
+        fingerprint = message_hash(
+            venue_id, AlertKind.ANOMALY.value, current, result.baseline_score, direction
+        )
+
+        # A venue that was flagged as unusually busy and is now unusually quiet
+        # is a different situation, not a repeat of the same one.
+        if state.get("active") and state.get("direction") != direction:
+            return AlertDecision(
+                True,
+                "direction flipped {} -> {}".format(state.get("direction"), direction),
+                direction=direction,
+            )
 
         if not state.get("active"):
             if elapsed_minutes is not None and elapsed_minutes < cfg.rearm_minutes:
                 return AlertDecision(
                     False,
                     "re-arm window: {:.0f} min < {} min".format(elapsed_minutes, cfg.rearm_minutes),
+                    direction=direction,
                 )
-            return AlertDecision(True, "new anomaly")
+            return AlertDecision(True, "new anomaly", direction=direction)
 
         if elapsed_minutes is None:
-            return AlertDecision(True, "active without timestamp")
+            return AlertDecision(True, "active without timestamp", direction=direction)
 
         if elapsed_minutes >= cfg.cooldown_minutes:
             return AlertDecision(
-                True, "cooldown elapsed ({:.0f} min)".format(elapsed_minutes)
+                True, "cooldown elapsed ({:.0f} min)".format(elapsed_minutes), direction=direction
             )
 
+        # "Worse" is direction-dependent: a busy venue getting busier, or a
+        # quiet one getting quieter.
         last_score = float(state.get("last_score") or 0.0)
-        if current >= last_score + cfg.escalation_delta:
+        if result.direction is Direction.LOW:
+            worsened = current <= last_score - cfg.escalation_delta
+            delta_text = "-{:.1f}".format(last_score - current)
+        else:
+            worsened = current >= last_score + cfg.escalation_delta
+            delta_text = "+{:.1f}".format(current - last_score)
+        if worsened:
             return AlertDecision(
                 True,
-                "escalation +{:.1f} (>= {:.1f})".format(current - last_score, cfg.escalation_delta),
+                "escalation {} (>= {:.1f})".format(delta_text, cfg.escalation_delta),
                 escalated=True,
+                direction=direction,
             )
 
         previous = self.storage.last_alert(venue_id, AlertKind.ANOMALY.value)
@@ -131,10 +160,12 @@ class AlertGate:
             return AlertDecision(
                 False,
                 "duplicate of alert {:.0f} min ago".format(elapsed_minutes),
+                direction=direction,
             )
         return AlertDecision(
             False,
             "cooldown active ({:.0f}/{} min)".format(elapsed_minutes, cfg.cooldown_minutes),
+            direction=direction,
         )
 
     def decide_recovery(self, result: AnomalyResult, now: Optional[datetime] = None) -> AlertDecision:
@@ -148,9 +179,17 @@ class AlertGate:
             return AlertDecision(False, "still anomalous", AlertKind.RECOVERY.value)
         if result.baseline is None or result.baseline.status is not BaselineStatus.OK:
             return AlertDecision(False, "no usable baseline", AlertKind.RECOVERY.value)
-        if result.current_score > result.baseline.median * self.config.recovery_ratio:
-            return AlertDecision(False, "not back to normal yet", AlertKind.RECOVERY.value)
-        return AlertDecision(True, "recovered", AlertKind.RECOVERY.value)
+
+        was = str(state.get("direction") or Direction.HIGH.value)
+        ratio = self.config.recovery_ratio
+        if was == Direction.LOW.value:
+            # it was unusually quiet -- recovery means coming back up
+            recovered = result.current_score >= result.baseline.median / max(ratio, 1e-9)
+        else:
+            recovered = result.current_score <= result.baseline.median * ratio
+        if not recovered:
+            return AlertDecision(False, "not back to normal yet", AlertKind.RECOVERY.value, direction=was)
+        return AlertDecision(True, "recovered", AlertKind.RECOVERY.value, direction=was)
 
 
 class MessageBuilder:
@@ -192,94 +231,173 @@ class MessageBuilder:
     # -- messages ---------------------------------------------------------- #
 
     def anomaly(self, result: AnomalyResult, *, escalated: bool = False) -> str:
-        venue = result.venue
-        obs = result.observation
-        header = "🔥 <b>Необычно высокая загрузка</b>"
-        if escalated:
-            header = "🔥🔥 <b>Загрузка продолжает расти</b>"
+        if result.direction is Direction.LOW:
+            return self._quiet(result, escalated=escalated)
+        return self._busy(result, escalated=escalated)
 
-        parts = [
-            header,
-            "",
-            "<b>{}</b>".format(self.esc(venue.name)),
-        ]
+    def _head(self, result: AnomalyResult) -> List[str]:
+        venue = result.venue
+        parts = ["<b>{}</b>".format(self.esc(venue.name))]
         if venue.category:
             parts.append("<i>{}</i>".format(self.esc(venue.category)))
         parts += [
             "",
-            "📍 {} от офиса {}".format(
+            "\U0001F4CD {} от офиса {}".format(
                 format_distance(venue.distance_meters), self.esc(self.settings.office.name)
             ),
-            "📊 Сейчас: {:.0f}/100 ({})".format(
+        ]
+        return parts
+
+    def _stats_lines(self, result: AnomalyResult, comparison: str) -> List[str]:
+        obs = result.observation
+        lines = [
+            "\U0001F4CA Сейчас: {:.0f}/100 ({})".format(
                 obs.load_score, BAND_LABELS.get(band_for_score(obs.load_score), "")
-            ),
+            )
         ]
         if result.baseline is not None and result.baseline.usable:
-            parts.append("📈 Обычно в это время: {:.0f}/100".format(result.baseline.median))
-            parts.append("⚠️ {:+.0f}% выше обычного".format(result.deviation_percent))
-            parts.append(
-                "🧮 robust z = {:.1f}, выборка {} набл. за {} нед.".format(
-                    result.robust_z,
-                    result.baseline.sample_count,
-                    self.settings.anomaly.lookback_weeks,
+            lines.append("\U0001F4C8 Обычно в это время: {:.0f}/100".format(result.baseline.median))
+            lines.append(comparison)
+            district = self._district_line(result)
+            if district:
+                lines.append(district)
+            lines.append(
+                "\U0001F9EE robust z = {:.1f}, выборка {} набл. за {} нед.".format(
+                    result.robust_z, result.baseline.sample_count, self.settings.anomaly.lookback_weeks
                 )
             )
         else:
-            parts.append("📈 Baseline: недостаточно истории (learning_baseline)")
+            lines.append("\U0001F4C8 Baseline: недостаточно истории (learning_baseline)")
+        return lines
 
-        parts.append("")
+    def _tail(self, result: AnomalyResult) -> List[str]:
+        obs = result.observation
+        parts = [""]
         parts.extend(self._metric_lines(result))
-        parts.append("")
-        parts.append(
-            "🧭 Тип сигнала: {}".format(
+        parts += [
+            "",
+            "\U0001F9ED Тип сигнала: {}".format(
                 self.esc(DOMAIN_LABELS.get(_domain(obs.domain), obs.domain))
-            )
-        )
-        parts.append(
-            "🔌 Источник: {} (качество: {}, confidence {:.2f})".format(
+            ),
+            "\U0001F50C Источник: {} (качество: {}, confidence {:.2f})".format(
                 self.esc(obs.source), self.esc(obs.signal_quality), obs.confidence
-            )
+            ),
+            "\U0001F553 Время проверки: {}".format(self.local_time(obs.timestamp)),
+        ]
+        if result.venue.website:
+            parts.append('\U0001F517 <a href="{}">сайт</a>'.format(self.esc(result.venue.website)))
+        return parts
+
+    def _district_line(self, result: AnomalyResult) -> Optional[str]:
+        """Show that the deviation is venue-specific, not district-wide."""
+        if abs(result.district_index - 1.0) < 0.02:
+            return "\U0001F310 Район в целом в норме — отклонение локальное"
+        return "\U0001F310 Район: {:+.0f}%, заведение относительно района: {:+.0f}%".format(
+            (result.district_index - 1.0) * 100.0, result.relative_percent
         )
-        parts.append("🕓 Время проверки: {}".format(self.local_time(obs.timestamp)))
-        if venue.website:
-            parts.append('🔗 <a href="{}">сайт</a>'.format(self.esc(venue.website)))
+
+    def _busy(self, result: AnomalyResult, *, escalated: bool = False) -> str:
+        parts = [
+            "\U0001F525\U0001F525 <b>Загрузка продолжает расти</b>"
+            if escalated
+            else "\U0001F525 <b>Необычно высокая загрузка</b>",
+            "",
+        ]
+        parts += self._head(result)
+        parts += self._stats_lines(
+            result, "\u26A0\uFE0F {:+.0f}% выше обычного".format(result.deviation_percent)
+        )
+        parts += self._tail(result)
+        return "\n".join(parts)
+
+    def _quiet(self, result: AnomalyResult, *, escalated: bool = False) -> str:
+        """Unusually *quiet*.
+
+        Worded as an observation about the venue, never as a conclusion about
+        why. A drop is consistent with people ordering delivery instead of
+        walking over, and equally consistent with a dozen other causes; this
+        data cannot tell them apart.
+        """
+        parts = [
+            "\U0001F4C9\U0001F4C9 <b>Загрузка продолжает падать</b>"
+            if escalated
+            else "\U0001F4C9 <b>Необычно низкая загрузка</b>",
+            "",
+        ]
+        parts += self._head(result)
+        parts += self._stats_lines(
+            result, "\u26A0\uFE0F {:.0f}% ниже обычного".format(abs(result.deviation_percent))
+        )
+        parts += self._tail(result)
+        parts += [
+            "",
+            "<i>Заведение посещают заметно реже обычного. Причина из этих данных "
+            "не следует — это наблюдение, а не вывод.</i>",
+        ]
         return "\n".join(parts)
 
     def aggregate(self, results: Sequence[AnomalyResult]) -> str:
-        ordered = sorted(results, key=lambda r: -r.deviation_percent)
+        high = sorted(
+            [r for r in results if r.direction is not Direction.LOW],
+            key=lambda r: -r.deviation_percent,
+        )
+        low = sorted(
+            [r for r in results if r.direction is Direction.LOW], key=lambda r: r.deviation_percent
+        )
+        ordered = high + low
         moment = ordered[0].observation.timestamp if ordered else utcnow()
+        district = ordered[0].district_index if ordered else 1.0
+
         parts = [
-            "🔥 <b>Повышенная загрузка рядом с {}</b>".format(self.esc(self.settings.office.name)),
-            "<i>{} {} выше обычного · проверка {}</i>".format(
+            "\U0001F514 <b>Необычная активность рядом с {}</b>".format(
+                self.esc(self.settings.office.name)
+            ),
+            "<i>{} {} · проверка {}</i>".format(
                 len(ordered),
                 plural_ru(len(ordered), "заведение", "заведения", "заведений"),
                 self.local_time(moment),
             ),
-            "",
         ]
-        for index, result in enumerate(ordered, start=1):
-            obs = result.observation
-            baseline_text = (
-                "{:.0f}".format(result.baseline.median)
-                if result.baseline is not None and result.baseline.usable
-                else "—"
-            )
+        if abs(district - 1.0) >= 0.02:
             parts.append(
-                "<b>{}. {}</b> — {:+.0f}%".format(
-                    index, self.esc(result.venue.name), result.deviation_percent
+                "<i>\U0001F310 район в целом: {:+.0f}% к обычному — учтено</i>".format(
+                    (district - 1.0) * 100.0
                 )
             )
-            parts.append(
-                "    📊 {:.0f}/100 (обычно {}) · 📍 {} · {}".format(
-                    obs.load_score,
-                    baseline_text,
-                    format_distance(result.venue.distance_meters),
-                    self.esc(obs.source),
+        parts.append("")
+
+        for title, group in (
+            ("\U0001F525 <b>Выше обычного</b>", high),
+            ("\U0001F4C9 <b>Ниже обычного</b>", low),
+        ):
+            if not group:
+                continue
+            parts.append(title)
+            for index, result in enumerate(group, start=1):
+                obs = result.observation
+                baseline_text = (
+                    "{:.0f}".format(result.baseline.median)
+                    if result.baseline is not None and result.baseline.usable
+                    else "—"
                 )
-            )
-            detail = self.normalizer.describe_metric(obs.metric_type, obs.metric_value)
-            parts.append("    {}".format(detail))
-            parts.append("")
+                parts.append(
+                    "<b>{}. {}</b> — {:+.0f}%".format(
+                        index, self.esc(result.venue.name), result.deviation_percent
+                    )
+                )
+                parts.append(
+                    "    \U0001F4CA {:.0f}/100 (обычно {}) · \U0001F4CD {} · {}".format(
+                        obs.load_score,
+                        baseline_text,
+                        format_distance(result.venue.distance_meters),
+                        self.esc(obs.source),
+                    )
+                )
+                parts.append(
+                    "    {}".format(self.normalizer.describe_metric(obs.metric_type, obs.metric_value))
+                )
+                parts.append("")
+
         parts.append(
             "<i>Показатель — proxy-метрика ({}), не фактическое число посетителей.</i>".format(
                 self.esc(
@@ -294,7 +412,7 @@ class MessageBuilder:
     def recovery(self, result: AnomalyResult, peak_score: float) -> str:
         return "\n".join(
             [
-                "✅ <b>Загрузка нормализовалась</b>",
+                "\u2705 <b>Загрузка вернулась к норме</b>",
                 "",
                 "<b>{}</b>".format(self.esc(result.venue.name)),
                 "Было: {:.0f}/100".format(peak_score or result.current_score),
@@ -501,7 +619,8 @@ class Notifier:
                     extra={"venue": result.venue.name, "reason": decision.reason},
                 )
 
-        to_alert.sort(key=lambda r: -r.deviation_percent)
+        # rank by how far from normal, in either direction
+        to_alert.sort(key=lambda r: -abs(r.deviation_percent))
         overflow = max(0, len(to_alert) - cfg.max_alerts_per_run)
         if overflow:
             log.warning("alert budget exceeded", extra={"dropped": overflow})
@@ -531,6 +650,10 @@ class Notifier:
                 continue
             state = self.storage.alert_state(result.venue.id)
             text = self.builder.recovery(result, float(state.get("peak_score") or 0.0))
+            log.info(
+                "recovery",
+                extra={"venue": result.venue.name, "was": state.get("direction")},
+            )
             delivered = self.client.send_message(text)
             self._record(result, AlertKind.RECOVERY.value, delivered, now, clear=True)
             recoveries += 1 if delivered else 0
@@ -551,6 +674,14 @@ class Notifier:
         *,
         clear: bool = False,
     ) -> None:
+        previous_state = self.storage.alert_state(result.venue.id)
+        if kind == AlertKind.RECOVERY.value:
+            direction = str(previous_state.get("direction") or Direction.HIGH.value)
+        elif result.direction is Direction.NONE:
+            direction = Direction.HIGH.value
+        else:
+            direction = result.direction.value
+
         self.storage.record_alert(
             AlertRecord(
                 venue_id=result.venue.id,
@@ -561,9 +692,10 @@ class Notifier:
                 metric_type=result.observation.metric_type,
                 sent_at=now,
                 message_hash=message_hash(
-                    result.venue.id, kind, result.current_score, result.baseline_score
+                    result.venue.id, kind, result.current_score, result.baseline_score, direction
                 ),
                 delivered=delivered,
+                direction=direction,
             )
         )
         if clear:
@@ -575,9 +707,17 @@ class Notifier:
                 last_score=result.current_score,
                 last_deviation=result.deviation_percent,
                 peak_score=0.0,
+                direction=direction,
             )
         else:
-            previous = self.storage.alert_state(result.venue.id)
+            # "peak" means the most extreme reading so far, in whichever
+            # direction the venue is currently flagged
+            previous_peak = float(previous_state.get("peak_score") or 0.0)
+            same_direction = previous_state.get("direction") == direction and previous_state.get("active")
+            if direction == Direction.LOW.value:
+                peak = min(previous_peak, result.current_score) if same_direction else result.current_score
+            else:
+                peak = max(previous_peak, result.current_score) if same_direction else result.current_score
             self.storage.set_alert_state(
                 result.venue.id,
                 metric_type=result.observation.metric_type,
@@ -585,17 +725,22 @@ class Notifier:
                 last_alert_at=now,
                 last_score=result.current_score,
                 last_deviation=result.deviation_percent,
-                peak_score=max(float(previous.get("peak_score") or 0.0), result.current_score),
+                peak_score=peak,
+                direction=direction,
             )
 
 
 def mark_state_from_observation(storage: BaseStorage, result: AnomalyResult) -> None:
-    """Track the peak while a venue stays anomalous between notifications."""
+    """Track the extreme while a venue stays flagged between notifications."""
     state = storage.alert_state(result.venue.id)
     if not state.get("active"):
         return
-    peak = max(float(state.get("peak_score") or 0.0), result.current_score)
-    if peak > float(state.get("peak_score") or 0.0):
+    current_peak = float(state.get("peak_score") or 0.0)
+    if state.get("direction") == Direction.LOW.value:
+        peak = min(current_peak, result.current_score)
+    else:
+        peak = max(current_peak, result.current_score)
+    if peak != current_peak:
         storage.set_alert_state(
             result.venue.id,
             metric_type=result.observation.metric_type,
@@ -604,5 +749,6 @@ def mark_state_from_observation(storage: BaseStorage, result: AnomalyResult) -> 
             last_score=float(state.get("last_score") or 0.0),
             last_deviation=float(state.get("last_deviation") or 0.0),
             peak_score=peak,
+            direction=str(state.get("direction") or Direction.HIGH.value),
         )
 
