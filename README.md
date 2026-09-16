@@ -253,8 +253,16 @@ Private chats have a positive id; groups and channels have a negative one.
 
 | Variable | Why |
 | --- | --- |
-| `TELEGRAM_MENTION` | e.g. `@hbbsx` — what gets prepended to change notifications so they break through a muted chat |
-| `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` | throttle the routine status message; 0 (default) is every run |
+| `TELEGRAM_MENTION` | e.g. `@hbbsx` — prepended to change notifications so they break through a muted chat. Accepted from the Secrets tab too |
+| `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` | throttle the routine status message. At the `*/10` cadence leave this at **360** or the chat gets one every ten minutes |
+| `TIMEZONE` | used to bucket daily rate history; defaults to `America/Los_Angeles` |
+| `RATE_MULTIPLIER` · `MIN_BASELINE_SAMPLES` · `BASELINE_LOOKBACK_WEEKS` | commit-burst sensitivity |
+| `OBSERVATION_RETENTION_DAYS` | how much numeric history to keep |
+
+A variable the code does not read is silently ignored, which is the worst kind
+of misconfiguration — nothing fails, the setting just does nothing. A CI test
+cross-checks every variable the workflow sets against every variable the code
+reads, so that cannot happen again.
 
 Everything else is keyless, and the GitHub API token is provided by Actions
 automatically.

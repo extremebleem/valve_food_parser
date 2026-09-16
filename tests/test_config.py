@@ -90,3 +90,29 @@ def test_unset_variable_falls_back_to_the_default(monkeypatch):
     settings = load_settings(None)
     assert settings.anomaly.min_baseline_samples == 7
     assert settings.timezone == "America/Los_Angeles"
+
+
+def test_the_workflow_sets_no_environment_variable_the_code_ignores():
+    """Three variables went stale when the project pivoted -- OFFICE_TIMEZONE,
+    ANOMALY_MULTIPLIER and a mention read from the wrong tab. Each was set in
+    the workflow and silently ignored by the code, which is the worst kind of
+    misconfiguration: nothing fails, the setting just does nothing.
+    """
+    import os
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    workflow = (root / ".github" / "workflows" / "watch.yml").read_text()
+    config = (root / "src" / "config.py").read_text()
+    code = "\n".join(p.read_text() for p in (root / "src").rglob("*.py"))
+
+    declared = set(re.findall(r"^\s{10}([A-Z][A-Z0-9_]+):", workflow, re.M))
+    read = set(re.findall(r'env_(?:str|bool|int|float|list)\("([A-Z0-9_]+)"', config))
+    read |= set(re.findall(r'environ\.get\("([A-Z0-9_]+)"', code))
+    # consumed by the runtime or the harness rather than by our own config
+    read |= {"GITHUB_TOKEN", "GH_TOKEN", "PYTHONUNBUFFERED"}
+
+    assert declared, "no env block found -- has the workflow layout changed?"
+    assert sorted(declared - read) == [], "workflow sets variables nothing reads"
+    assert os.sep  # keep the import meaningful on every platform

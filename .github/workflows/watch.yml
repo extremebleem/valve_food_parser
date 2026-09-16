@@ -115,7 +115,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # a plain @username mention breaks through a muted chat, so routine
           # runs stay silent and only real changes ping
-          TELEGRAM_MENTION: ${{ vars.TELEGRAM_MENTION }}
+          # accepted from either tab: a mention is not a secret, but it is a
+          # natural thing to put next to the bot token, and a silently
+          # ignored value would quietly defeat the muted-chat design
+          TELEGRAM_MENTION: ${{ vars.TELEGRAM_MENTION || secrets.TELEGRAM_MENTION }}
           TELEGRAM_HEARTBEAT: ${{ vars.TELEGRAM_HEARTBEAT }}
           TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES: ${{ vars.TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES }}
           # free, and raises the GitHub API limit from 60/h to 1000/h
@@ -124,9 +127,12 @@ jobs:
           # optional; unlocks the CS2 matchmaking/scheduler signal
           STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
           DELTA_ALERT_FRACTION: ${{ vars.DELTA_ALERT_FRACTION }}
-          OFFICE_TIMEZONE: ${{ vars.OFFICE_TIMEZONE || 'America/Los_Angeles' }}
-          ANOMALY_MULTIPLIER: ${{ vars.ANOMALY_MULTIPLIER }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'America/Los_Angeles' }}
+          RATE_MULTIPLIER: ${{ vars.RATE_MULTIPLIER }}
+          RATE_MIN_ABSOLUTE_DELTA: ${{ vars.RATE_MIN_ABSOLUTE_DELTA }}
           MIN_BASELINE_SAMPLES: ${{ vars.MIN_BASELINE_SAMPLES }}
+          BASELINE_LOOKBACK_WEEKS: ${{ vars.BASELINE_LOOKBACK_WEEKS }}
+          OBSERVATION_RETENTION_DAYS: ${{ vars.OBSERVATION_RETENTION_DAYS }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
           LOG_FORMAT: json
