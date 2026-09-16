@@ -136,6 +136,9 @@ class Monitor:
         last_error: Optional[str] = None
         for provider in self.providers:
             if not provider.supports(venue):
+                if getattr(provider, "budget_exhausted", False):
+                    # not a failure and not "no data": we chose not to ask
+                    last_error = "budget:{}".format(provider.name)
                 continue
             try:
                 signal = provider.get_current_load(venue)
@@ -242,6 +245,9 @@ class Monitor:
         workers = max(1, min(int(concurrency), 16))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for venue, observation, error in pool.map(work, venues):
+                if error and error.startswith("budget:"):
+                    stats.venues_skipped_budget += 1
+                    continue
                 if error:
                     stats.venues_failed += 1
                     key = error.split(":", 1)[0]
@@ -362,6 +368,7 @@ class Monitor:
                 "venues_open": stats.venues_open,
                 "venues_checked": stats.venues_checked,
                 "venues_no_data": stats.venues_no_data,
+                "venues_skipped_budget": stats.venues_skipped_budget,
                 "venues_failed": stats.venues_failed,
                 "live_coverage_pct": (
                     round(100.0 * stats.venues_checked / max(1, stats.venues_checked + stats.venues_no_data))

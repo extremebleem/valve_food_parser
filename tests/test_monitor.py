@@ -414,3 +414,21 @@ def test_venues_without_a_reading_are_counted_separately_from_failures(settings,
     assert stats.venues_no_data == 1
     assert stats.venues_failed == 1
     assert "venues_no_data=1" in stats.as_logline()
+
+
+def test_budget_skipped_venues_are_not_counted_as_failures(settings, storage):
+    """A venue we chose not to poll is neither a failure nor missing coverage,
+    so it must not distort live_coverage_pct."""
+
+    class Broke(StubProvider):
+        budget_exhausted = True
+
+        def supports(self, venue):
+            return False
+
+    storage.upsert_venues([make_venue("A"), make_venue("B", distance=200)])
+    stats = build(settings, storage, [Broke(settings, {})]).run(concurrency=1)
+    assert stats.venues_skipped_budget == 2
+    assert stats.venues_failed == 0
+    assert stats.venues_no_data == 0
+    assert "venues_skipped_budget=2" in stats.as_logline()

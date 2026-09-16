@@ -56,6 +56,11 @@ class BestTimeProvider(LoadProvider):
         # at 20s against besttime.app.
         self.client.timeout = max(settings.http.timeout_seconds, 60.0)
         self.max_new_forecasts = int(os.environ.get("BESTTIME_MAX_NEW_FORECASTS_PER_RUN", "10"))
+        # Circuit breaker. Credits are real money and a misconfigured venue cap
+        # can drain a balance in a single evening, so the provider refuses to
+        # spend past this in one run whatever the caller asks for.
+        self.credit_budget = int(os.environ.get("BESTTIME_MAX_CREDITS_PER_RUN", "120"))
+        self._budget_warned = False
         self._new_forecasts_used = 0
         self._resolved: Dict[str, str] = {}
         self.credits_spent = 0
@@ -64,7 +69,22 @@ class BestTimeProvider(LoadProvider):
     def enabled(self) -> bool:
         return bool(self.private_key)
 
+    @property
+    def budget_exhausted(self) -> bool:
+        if self.credit_budget <= 0:
+            return False
+        spent = self.credits_spent >= self.credit_budget
+        if spent and not self._budget_warned:
+            self._budget_warned = True
+            log.warning(
+                "besttime credit budget exhausted for this run",
+                extra={"spent": self.credits_spent, "budget": self.credit_budget},
+            )
+        return spent
+
     def supports(self, venue: Venue) -> bool:
+        if self.budget_exhausted:
+            return False
         # needs either a known provider id, or enough identity to look one up
         return bool(venue.source_ids.get("besttime") or (venue.name and venue.address))
 
@@ -106,7 +126,7 @@ class BestTimeProvider(LoadProvider):
         if not self.private_key:
             return
         for venue in venues:
-            if self._new_forecasts_used >= self.max_new_forecasts:
+            if self._new_forecasts_used >= self.max_new_forecasts or self.budget_exhausted:
                 return
             if venue.source_ids.get("besttime") or self._resolved.get(venue.id):
                 continue
@@ -123,6 +143,7 @@ class BestTimeProvider(LoadProvider):
     def stats(self) -> Dict[str, Any]:
         return {
             "credits_spent": self.credits_spent,
+            "credit_budget": self.credit_budget,
             "new_forecasts": self._new_forecasts_used,
             "requests": self.client.request_count,
         }

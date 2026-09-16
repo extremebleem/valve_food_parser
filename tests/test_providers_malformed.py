@@ -461,3 +461,24 @@ def test_besttime_logs_a_not_ok_status_without_crashing(settings, venue):
     # a real handler must actually format the record, or the bug stays hidden
     logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
     assert bt(settings).parse_live(payload, venue) is None
+
+
+def test_besttime_stops_spending_once_the_run_budget_is_gone(settings, monkeypatch):
+    """Credits are real money. A misconfigured venue cap must not be able to
+    drain a balance in one evening."""
+    monkeypatch.setenv("BESTTIME_MAX_CREDITS_PER_RUN", "5")
+    provider = bt(settings)
+    venue = Venue(id="v", name="Cafe", address="1 Main St")
+    assert provider.budget_exhausted is False
+    assert provider.supports(venue) is True
+
+    provider.credits_spent = 5
+    assert provider.budget_exhausted is True
+    assert provider.supports(venue) is False
+
+
+def test_besttime_budget_can_be_disabled(settings, monkeypatch):
+    monkeypatch.setenv("BESTTIME_MAX_CREDITS_PER_RUN", "0")
+    provider = bt(settings)
+    provider.credits_spent = 10_000
+    assert provider.budget_exhausted is False
