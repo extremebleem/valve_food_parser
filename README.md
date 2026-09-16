@@ -595,6 +595,15 @@ enough for the approach to work, and no amount of threshold tuning will fix it.
 
 ## 14. API usage and cost estimate
 
+> **Check your BestTime balance before enabling the schedule.** Registration
+> grants **100 free credits in total** — not per month, not per day. One live
+> reading costs 1 credit and resolving a venue for the first time costs 2, so a
+> single unconstrained run over 150 venues exhausts the free tier several times
+> over. `BESTTIME_MAX_CREDITS_PER_RUN` (default 120) is a circuit breaker, not a
+> budget: set `MAX_VENUES_PER_RUN` and the cron to match what you are actually
+> willing to pay for. Paid tiers start at about $5/month.
+
+
 Measured against the real 248-venue dataset around the default office
 (`scripts/monitor` was run with a no-op provider to count the open/closed gate):
 
@@ -643,6 +652,7 @@ cron already spans the UTC hours these windows map to.
 | `MAX_VENUES_PER_RUN=40` | 150 → 40 venues per run |
 | `ACTIVE_HOURS_START/END` (default 14–21) + `*/30` cron | 72 → **14** effective runs/day |
 | `BESTTIME_MAX_NEW_FORECASTS_PER_RUN` | caps the one-off onboarding spend |
+| `BESTTIME_MAX_CREDITS_PER_RUN` (default 120) | hard circuit breaker: the provider stops calling once this is spent, whatever the venue cap says |
 
 Discovery deliberately runs **daily, not every 30 minutes**.
 
