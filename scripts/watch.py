@@ -105,7 +105,7 @@ def run_loop(settings, storage, args) -> int:
                 build_providers(settings),
                 notifier=WatchNotifier(settings, storage),
             ).run()
-        except Exception as exc:  # one bad pass must not end the job
+        except Exception:  # one bad pass must not end the job
             failures += 1
             log.exception("loop iteration failed", extra={"iteration": iteration})
             if failures >= 10:
