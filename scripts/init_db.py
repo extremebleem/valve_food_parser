@@ -16,7 +16,7 @@ from src.storage import StorageError, create_storage
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Initialise the monitor database")
+    parser = argparse.ArgumentParser(description="Initialise the watch database")
     parser.add_argument("--stats", action="store_true", help="print row counts after migrating")
     parser.add_argument("--env-file", default=".env")
     args = parser.parse_args(argv)
@@ -36,7 +36,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         with create_storage(settings.database_url) as storage:
             print("schema ready on {}".format(redacted))
             if args.stats:
-                for table in ("venues", "observations", "baselines", "alerts", "alert_state", "runs"):
+                for table in (
+                    "subjects",
+                    "watch_state",
+                    "watch_events",
+                    "subject_observations",
+                    "alerts",
+                    "runs",
+                ):
                     row = storage.fetchone("SELECT COUNT(*) FROM {}".format(table))
                     print("  {:<12} {}".format(table, row[0] if row else 0))
     except StorageError as exc:

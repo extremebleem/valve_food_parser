@@ -1,35 +1,20 @@
-"""Telegram notification: gating, formatting and delivery.
+"""Telegram Bot API transport and message plumbing.
 
-Three separable concerns, deliberately kept apart so each is testable:
-
-* :class:`AlertGate`     -- may this alert be sent at all? (cooldown, dedupe)
-* :class:`MessageBuilder` -- what does the message say?
-* :class:`TelegramClient` -- put it on the wire (or on stdout in dry-run)
+Domain-free on purpose: this module knows how to put text on the wire, split it
+under the 4096-character limit and print it instead when ``DRY_RUN`` is set.
+What the text *says* belongs to :mod:`src.watch_telegram`.
 """
 
 from __future__ import annotations
 
-import hashlib
 import html
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List
 
-from .config import AlertConfig, Settings
-from .geo import format_distance
+from .config import Settings
 from .http import HttpError, client_from_settings
 from .logging_utils import get_logger, redact
-from .models import (
-    AlertKind,
-    AlertRecord,
-    AnomalyResult,
-    BaselineStatus,
-    Direction,
-    band_for_score,
-    utcnow,
-)
-from .normalization import BAND_LABELS, DOMAIN_LABELS, Normalizer
-from .storage import BaseStorage
+from .models import utcnow
 
 log = get_logger(__name__)
 
@@ -37,7 +22,7 @@ TELEGRAM_MAX_CHARS = 4096
 
 
 def plural_ru(count: int, one: str, few: str, many: str) -> str:
-    """Russian pluralisation (1 заведение / 2 заведения / 5 заведений)."""
+    """Russian pluralisation (1 сигнал / 2 сигнала / 5 сигналов)."""
     tail_100 = abs(count) % 100
     tail_10 = abs(count) % 10
     if 11 <= tail_100 <= 14:
@@ -47,406 +32,6 @@ def plural_ru(count: int, one: str, few: str, many: str) -> str:
     if 2 <= tail_10 <= 4:
         return few
     return many
-
-
-def message_hash(
-    venue_id: str, kind: str, score: float, baseline: float, direction: str = "high"
-) -> str:
-    """Content fingerprint used to suppress repeats that say the same thing.
-
-    Scores are floored into 5-point bins, so a small wobble inside a bin
-    produces an identical hash. This is a secondary guard only -- the cooldown
-    in :class:`AlertGate` is what actually bounds the notification rate, because
-    two scores either side of a bin edge still hash differently.
-    """
-    key = "{}|{}|{}|{:.0f}|{:.0f}".format(venue_id, kind, direction, score // 5, baseline // 5)
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
-
-
-@dataclass
-class AlertDecision:
-    should_send: bool
-    reason: str
-    kind: str = AlertKind.ANOMALY.value
-    escalated: bool = False
-    direction: str = Direction.HIGH.value
-
-
-class AlertGate:
-    """Cooldown + de-duplication.
-
-    A repeat notification for a venue that is still anomalous is allowed when:
-
-    * ``ALERT_COOLDOWN_MINUTES`` has elapsed since the last one, **or**
-    * the load score climbed by at least ``ALERT_ESCALATION_DELTA`` (the
-      situation got materially worse).
-
-    A venue that recovered and became anomalous again re-arms immediately, with
-    an ``ALERT_REARM_MINUTES`` floor so a venue oscillating around the threshold
-    cannot spam the chat.
-    """
-
-    def __init__(self, storage: BaseStorage, config: Optional[AlertConfig] = None) -> None:
-        self.storage = storage
-        self.config = config or AlertConfig()
-
-    def decide(self, result: AnomalyResult, now: Optional[datetime] = None) -> AlertDecision:
-        now = now or utcnow()
-        cfg = self.config
-        venue_id = result.venue.id
-        state = self.storage.alert_state(venue_id)
-        last_at = state.get("last_alert_at")
-        elapsed_minutes = (
-            (now - last_at).total_seconds() / 60.0 if isinstance(last_at, datetime) else None
-        )
-
-        if not result.is_anomaly:
-            return AlertDecision(False, "not an anomaly")
-
-        current = result.current_score
-        # an anomaly always has a direction; fall back to the classic high case
-        direction = (
-            result.direction.value if result.direction is not Direction.NONE else Direction.HIGH.value
-        )
-        fingerprint = message_hash(
-            venue_id, AlertKind.ANOMALY.value, current, result.baseline_score, direction
-        )
-
-        # A venue that was flagged as unusually busy and is now unusually quiet
-        # is a different situation, not a repeat of the same one.
-        if state.get("active") and state.get("direction") != direction:
-            return AlertDecision(
-                True,
-                "direction flipped {} -> {}".format(state.get("direction"), direction),
-                direction=direction,
-            )
-
-        if not state.get("active"):
-            if elapsed_minutes is not None and elapsed_minutes < cfg.rearm_minutes:
-                return AlertDecision(
-                    False,
-                    "re-arm window: {:.0f} min < {} min".format(elapsed_minutes, cfg.rearm_minutes),
-                    direction=direction,
-                )
-            return AlertDecision(True, "new anomaly", direction=direction)
-
-        if elapsed_minutes is None:
-            return AlertDecision(True, "active without timestamp", direction=direction)
-
-        if elapsed_minutes >= cfg.cooldown_minutes:
-            return AlertDecision(
-                True, "cooldown elapsed ({:.0f} min)".format(elapsed_minutes), direction=direction
-            )
-
-        # "Worse" is direction-dependent: a busy venue getting busier, or a
-        # quiet one getting quieter.
-        last_score = float(state.get("last_score") or 0.0)
-        if result.direction is Direction.LOW:
-            worsened = current <= last_score - cfg.escalation_delta
-            delta_text = "-{:.1f}".format(last_score - current)
-        else:
-            worsened = current >= last_score + cfg.escalation_delta
-            delta_text = "+{:.1f}".format(current - last_score)
-        if worsened:
-            return AlertDecision(
-                True,
-                "escalation {} (>= {:.1f})".format(delta_text, cfg.escalation_delta),
-                escalated=True,
-                direction=direction,
-            )
-
-        previous = self.storage.last_alert(venue_id, AlertKind.ANOMALY.value)
-        if previous and previous.message_hash == fingerprint:
-            return AlertDecision(
-                False,
-                "duplicate of alert {:.0f} min ago".format(elapsed_minutes),
-                direction=direction,
-            )
-        return AlertDecision(
-            False,
-            "cooldown active ({:.0f}/{} min)".format(elapsed_minutes, cfg.cooldown_minutes),
-            direction=direction,
-        )
-
-    def decide_recovery(self, result: AnomalyResult, now: Optional[datetime] = None) -> AlertDecision:
-        now = now or utcnow()
-        if not self.config.send_recovery:
-            return AlertDecision(False, "recovery alerts disabled", AlertKind.RECOVERY.value)
-        state = self.storage.alert_state(result.venue.id)
-        if not state.get("active"):
-            return AlertDecision(False, "venue was not in an alerting state", AlertKind.RECOVERY.value)
-        if result.is_anomaly:
-            return AlertDecision(False, "still anomalous", AlertKind.RECOVERY.value)
-        if result.baseline is None or result.baseline.status is not BaselineStatus.OK:
-            return AlertDecision(False, "no usable baseline", AlertKind.RECOVERY.value)
-
-        was = str(state.get("direction") or Direction.HIGH.value)
-        ratio = self.config.recovery_ratio
-        if was == Direction.LOW.value:
-            # it was unusually quiet -- recovery means coming back up
-            recovered = result.current_score >= result.baseline.median / max(ratio, 1e-9)
-        else:
-            recovered = result.current_score <= result.baseline.median * ratio
-        if not recovered:
-            return AlertDecision(False, "not back to normal yet", AlertKind.RECOVERY.value, direction=was)
-        return AlertDecision(True, "recovered", AlertKind.RECOVERY.value, direction=was)
-
-
-class MessageBuilder:
-    """Renders Telegram messages (HTML parse mode)."""
-
-    def __init__(self, settings: Settings, normalizer: Optional[Normalizer] = None) -> None:
-        self.settings = settings
-        self.normalizer = normalizer or Normalizer(settings.normalization)
-
-    # -- helpers ----------------------------------------------------------- #
-
-    @staticmethod
-    def esc(text: Any) -> str:
-        return html.escape(str(text), quote=False)
-
-    def local_time(self, moment: datetime) -> str:
-        return moment.astimezone(self._tz()).strftime("%H:%M")
-
-    def _tz(self):
-        try:
-            from zoneinfo import ZoneInfo
-
-            return ZoneInfo(self.settings.office.timezone)
-        except Exception:  # pragma: no cover - tzdata missing
-            from datetime import timezone
-
-            return timezone.utc
-
-    def _metric_lines(self, result: AnomalyResult) -> List[str]:
-        """Raw-metric context ("Delivery ETA 55 min, usually ~32")."""
-        obs = result.observation
-        lines = [self.normalizer.describe_metric(obs.metric_type, obs.metric_value)]
-        if result.baseline is not None and result.baseline.usable:
-            usual = self.normalizer.invert(obs.metric_type, result.baseline.median)
-            if usual is not None and self.normalizer.envelope(obs.metric_type) is not None:
-                lines.append("🕐 Обычно: ~{:.0f} мин".format(usual))
-        return lines
-
-    # -- messages ---------------------------------------------------------- #
-
-    def anomaly(self, result: AnomalyResult, *, escalated: bool = False) -> str:
-        if result.direction is Direction.LOW:
-            return self._quiet(result, escalated=escalated)
-        return self._busy(result, escalated=escalated)
-
-    def _head(self, result: AnomalyResult) -> List[str]:
-        venue = result.venue
-        parts = ["<b>{}</b>".format(self.esc(venue.name))]
-        if venue.category:
-            parts.append("<i>{}</i>".format(self.esc(venue.category)))
-        parts += [
-            "",
-            "\U0001F4CD {} от офиса {}".format(
-                format_distance(venue.distance_meters), self.esc(self.settings.office.name)
-            ),
-        ]
-        return parts
-
-    def _stats_lines(self, result: AnomalyResult, comparison: str) -> List[str]:
-        obs = result.observation
-        lines = [
-            "\U0001F4CA Сейчас: {:.0f}/100 ({})".format(
-                obs.load_score, BAND_LABELS.get(band_for_score(obs.load_score), "")
-            )
-        ]
-        if result.baseline is not None and result.baseline.usable:
-            lines.append("\U0001F4C8 Обычно в это время: {:.0f}/100".format(result.baseline.median))
-            lines.append(comparison)
-            district = self._district_line(result)
-            if district:
-                lines.append(district)
-            lines.append(
-                "\U0001F9EE robust z = {:.1f}, выборка {} набл. за {} нед.".format(
-                    result.robust_z, result.baseline.sample_count, self.settings.anomaly.lookback_weeks
-                )
-            )
-        else:
-            lines.append("\U0001F4C8 Baseline: недостаточно истории (learning_baseline)")
-        return lines
-
-    def _tail(self, result: AnomalyResult) -> List[str]:
-        obs = result.observation
-        parts = [""]
-        parts.extend(self._metric_lines(result))
-        parts += [
-            "",
-            "\U0001F9ED Тип сигнала: {}".format(
-                self.esc(DOMAIN_LABELS.get(_domain(obs.domain), obs.domain))
-            ),
-            "\U0001F50C Источник: {} (качество: {}, confidence {:.2f})".format(
-                self.esc(obs.source), self.esc(obs.signal_quality), obs.confidence
-            ),
-            "\U0001F553 Время проверки: {}".format(self.local_time(obs.timestamp)),
-        ]
-        if result.venue.website:
-            parts.append('\U0001F517 <a href="{}">сайт</a>'.format(self.esc(result.venue.website)))
-        return parts
-
-    def _district_line(self, result: AnomalyResult) -> Optional[str]:
-        """Show that the deviation is venue-specific, not district-wide."""
-        if abs(result.district_index - 1.0) < 0.02:
-            return "\U0001F310 Район в целом в норме — отклонение локальное"
-        return "\U0001F310 Район: {:+.0f}%, заведение относительно района: {:+.0f}%".format(
-            (result.district_index - 1.0) * 100.0, result.relative_percent
-        )
-
-    def _busy(self, result: AnomalyResult, *, escalated: bool = False) -> str:
-        parts = [
-            "\U0001F525\U0001F525 <b>Загрузка продолжает расти</b>"
-            if escalated
-            else "\U0001F525 <b>Необычно высокая загрузка</b>",
-            "",
-        ]
-        parts += self._head(result)
-        parts += self._stats_lines(
-            result, "\u26A0\uFE0F {:+.0f}% выше обычного".format(result.deviation_percent)
-        )
-        parts += self._tail(result)
-        return "\n".join(parts)
-
-    def _quiet(self, result: AnomalyResult, *, escalated: bool = False) -> str:
-        """Unusually *quiet*.
-
-        Worded as an observation about the venue, never as a conclusion about
-        why. A drop is consistent with people ordering delivery instead of
-        walking over, and equally consistent with a dozen other causes; this
-        data cannot tell them apart.
-        """
-        parts = [
-            "\U0001F4C9\U0001F4C9 <b>Загрузка продолжает падать</b>"
-            if escalated
-            else "\U0001F4C9 <b>Необычно низкая загрузка</b>",
-            "",
-        ]
-        parts += self._head(result)
-        parts += self._stats_lines(
-            result, "\u26A0\uFE0F {:.0f}% ниже обычного".format(abs(result.deviation_percent))
-        )
-        parts += self._tail(result)
-        parts += [
-            "",
-            "<i>Заведение посещают заметно реже обычного. Причина из этих данных "
-            "не следует — это наблюдение, а не вывод.</i>",
-        ]
-        return "\n".join(parts)
-
-    def aggregate(self, results: Sequence[AnomalyResult]) -> str:
-        high = sorted(
-            [r for r in results if r.direction is not Direction.LOW],
-            key=lambda r: -r.deviation_percent,
-        )
-        low = sorted(
-            [r for r in results if r.direction is Direction.LOW], key=lambda r: r.deviation_percent
-        )
-        ordered = high + low
-        moment = ordered[0].observation.timestamp if ordered else utcnow()
-        district = ordered[0].district_index if ordered else 1.0
-
-        parts = [
-            "\U0001F514 <b>Необычная активность рядом с {}</b>".format(
-                self.esc(self.settings.office.name)
-            ),
-            "<i>{} {} · проверка {}</i>".format(
-                len(ordered),
-                plural_ru(len(ordered), "заведение", "заведения", "заведений"),
-                self.local_time(moment),
-            ),
-        ]
-        if abs(district - 1.0) >= 0.02:
-            parts.append(
-                "<i>\U0001F310 район в целом: {:+.0f}% к обычному — учтено</i>".format(
-                    (district - 1.0) * 100.0
-                )
-            )
-        parts.append("")
-
-        for title, group in (
-            ("\U0001F525 <b>Выше обычного</b>", high),
-            ("\U0001F4C9 <b>Ниже обычного</b>", low),
-        ):
-            if not group:
-                continue
-            parts.append(title)
-            for index, result in enumerate(group, start=1):
-                obs = result.observation
-                baseline_text = (
-                    "{:.0f}".format(result.baseline.median)
-                    if result.baseline is not None and result.baseline.usable
-                    else "—"
-                )
-                parts.append(
-                    "<b>{}. {}</b> — {:+.0f}%".format(
-                        index, self.esc(result.venue.name), result.deviation_percent
-                    )
-                )
-                parts.append(
-                    "    \U0001F4CA {:.0f}/100 (обычно {}) · \U0001F4CD {} · {}".format(
-                        obs.load_score,
-                        baseline_text,
-                        format_distance(result.venue.distance_meters),
-                        self.esc(obs.source),
-                    )
-                )
-                parts.append(
-                    "    {}".format(self.normalizer.describe_metric(obs.metric_type, obs.metric_value))
-                )
-                parts.append("")
-
-        parts.append(
-            "<i>Показатель — proxy-метрика ({}), не фактическое число посетителей.</i>".format(
-                self.esc(
-                    ", ".join(
-                        sorted({DOMAIN_LABELS.get(_domain(r.observation.domain), "n/a") for r in ordered})
-                    )
-                )
-            )
-        )
-        return "\n".join(parts)
-
-    def recovery(self, result: AnomalyResult, peak_score: float) -> str:
-        return "\n".join(
-            [
-                "\u2705 <b>Загрузка вернулась к норме</b>",
-                "",
-                "<b>{}</b>".format(self.esc(result.venue.name)),
-                "Было: {:.0f}/100".format(peak_score or result.current_score),
-                "Сейчас: {:.0f}/100".format(result.current_score),
-                "Обычно в это время: {:.0f}/100".format(result.baseline_score),
-                "",
-                "🕓 {}".format(self.local_time(result.observation.timestamp)),
-            ]
-        )
-
-    def test_message(self) -> str:
-        office = self.settings.office
-        return "\n".join(
-            [
-                "✅ <b>valve-food-monitor: тестовое сообщение</b>",
-                "",
-                "Бот настроен правильно.",
-                "Офис: <b>{}</b>".format(self.esc(office.name)),
-                "Адрес: {}".format(self.esc(office.address)),
-                "Координаты: {:.5f}, {:.5f}".format(office.latitude, office.longitude),
-                "Радиус поиска: {} м".format(office.radius_meters),
-                "Часовой пояс: {}".format(self.esc(office.timezone)),
-                "Время: {}".format(self.local_time(utcnow())),
-            ]
-        )
-
-
-def _domain(value: Any):
-    from .models import CongestionDomain
-
-    try:
-        return CongestionDomain(str(value))
-    except ValueError:
-        return CongestionDomain.UNKNOWN
 
 
 def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> List[str]:
@@ -473,6 +58,41 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> List[str]:
     if current:
         chunks.append("\n\n".join(current))
     return chunks
+
+
+class MessageBuilder:
+    """Shared formatting helpers."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    @staticmethod
+    def esc(text: Any) -> str:
+        return html.escape(str(text), quote=False)
+
+    def tz(self):
+        try:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo(self.settings.timezone)
+        except Exception:  # pragma: no cover - tzdata missing
+            from datetime import timezone
+
+            return timezone.utc
+
+    def local_time(self, moment: datetime) -> str:
+        return moment.astimezone(self.tz()).strftime("%H:%M")
+
+    def test_message(self) -> str:
+        return "\n".join(
+            [
+                "✅ <b>valve-watch: тестовое сообщение</b>",
+                "",
+                "Бот настроен правильно.",
+                "Часовой пояс: {}".format(self.esc(self.settings.timezone)),
+                "Время: {}".format(self.local_time(utcnow())),
+            ]
+        )
 
 
 class TelegramClient:
@@ -545,7 +165,7 @@ class TelegramClient:
         return ok
 
     def describe_chat(self) -> Dict[str, Any]:
-        """``getChat`` -- used by ``--test-telegram`` to prove the id is right."""
+        """``getChat`` -- proves the configured chat id resolves."""
         if not self.configured:
             return {"ok": False, "error": "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set"}
         try:
@@ -573,182 +193,10 @@ class TelegramClient:
                         {
                             "id": chat.get("id"),
                             "type": chat.get("type"),
-                            "title": chat.get("title") or chat.get("username") or chat.get("first_name"),
+                            "title": chat.get("title")
+                            or chat.get("username")
+                            or chat.get("first_name"),
                         }
                     )
         unique: Dict[Any, Dict[str, Any]] = {item["id"]: item for item in found}
         return list(unique.values())
-
-
-class Notifier:
-    """Glues the gate, the builder, the transport and the alert log together."""
-
-    def __init__(
-        self,
-        settings: Settings,
-        storage: BaseStorage,
-        client: Optional[TelegramClient] = None,
-    ) -> None:
-        self.settings = settings
-        self.storage = storage
-        self.gate = AlertGate(storage, settings.alerts)
-        self.builder = MessageBuilder(settings)
-        self.client = client or TelegramClient(settings)
-
-    def process(self, results: Sequence[AnomalyResult]) -> Dict[str, Any]:
-        """Decide, send and record. Returns counters for the run summary."""
-        now = utcnow()
-        cfg = self.settings.alerts
-
-        to_alert: List[AnomalyResult] = []
-        suppressed: List[str] = []
-        escalated_ids = set()
-
-        for result in results:
-            if not result.is_anomaly:
-                continue
-            decision = self.gate.decide(result, now)
-            if decision.should_send:
-                to_alert.append(result)
-                if decision.escalated:
-                    escalated_ids.add(result.venue.id)
-            else:
-                suppressed.append("{}: {}".format(result.venue.name, decision.reason))
-                log.info(
-                    "alert suppressed",
-                    extra={"venue": result.venue.name, "reason": decision.reason},
-                )
-
-        # rank by how far from normal, in either direction
-        to_alert.sort(key=lambda r: -abs(r.deviation_percent))
-        overflow = max(0, len(to_alert) - cfg.max_alerts_per_run)
-        if overflow:
-            log.warning("alert budget exceeded", extra={"dropped": overflow})
-            suppressed.extend(
-                "{}: over MAX_ALERTS_PER_RUN".format(r.venue.name)
-                for r in to_alert[cfg.max_alerts_per_run :]
-            )
-            to_alert = to_alert[: cfg.max_alerts_per_run]
-
-        sent = 0
-        if to_alert:
-            if cfg.aggregate and len(to_alert) > 1:
-                text = self.builder.aggregate(to_alert)
-            else:
-                text = self.builder.anomaly(
-                    to_alert[0], escalated=to_alert[0].venue.id in escalated_ids
-                )
-            delivered = self.client.send_message(text)
-            sent = len(to_alert) if delivered else 0
-            for result in to_alert:
-                self._record(result, AlertKind.ANOMALY.value, delivered, now)
-
-        recoveries = 0
-        for result in results:
-            decision = self.gate.decide_recovery(result, now)
-            if not decision.should_send:
-                continue
-            state = self.storage.alert_state(result.venue.id)
-            text = self.builder.recovery(result, float(state.get("peak_score") or 0.0))
-            log.info(
-                "recovery",
-                extra={"venue": result.venue.name, "was": state.get("direction")},
-            )
-            delivered = self.client.send_message(text)
-            self._record(result, AlertKind.RECOVERY.value, delivered, now, clear=True)
-            recoveries += 1 if delivered else 0
-
-        return {
-            "alerts_sent": sent,
-            "alerts_suppressed": len(suppressed),
-            "recoveries_sent": recoveries,
-            "suppressed_reasons": suppressed[:20],
-        }
-
-    def _record(
-        self,
-        result: AnomalyResult,
-        kind: str,
-        delivered: bool,
-        now: datetime,
-        *,
-        clear: bool = False,
-    ) -> None:
-        previous_state = self.storage.alert_state(result.venue.id)
-        if kind == AlertKind.RECOVERY.value:
-            direction = str(previous_state.get("direction") or Direction.HIGH.value)
-        elif result.direction is Direction.NONE:
-            direction = Direction.HIGH.value
-        else:
-            direction = result.direction.value
-
-        self.storage.record_alert(
-            AlertRecord(
-                venue_id=result.venue.id,
-                kind=kind,
-                load_score=result.current_score,
-                baseline_score=result.baseline_score,
-                deviation_percent=result.deviation_percent,
-                metric_type=result.observation.metric_type,
-                sent_at=now,
-                message_hash=message_hash(
-                    result.venue.id, kind, result.current_score, result.baseline_score, direction
-                ),
-                delivered=delivered,
-                direction=direction,
-            )
-        )
-        if clear:
-            self.storage.set_alert_state(
-                result.venue.id,
-                metric_type=result.observation.metric_type,
-                active=False,
-                last_alert_at=now,
-                last_score=result.current_score,
-                last_deviation=result.deviation_percent,
-                peak_score=0.0,
-                direction=direction,
-            )
-        else:
-            # "peak" means the most extreme reading so far, in whichever
-            # direction the venue is currently flagged
-            previous_peak = float(previous_state.get("peak_score") or 0.0)
-            same_direction = previous_state.get("direction") == direction and previous_state.get("active")
-            if direction == Direction.LOW.value:
-                peak = min(previous_peak, result.current_score) if same_direction else result.current_score
-            else:
-                peak = max(previous_peak, result.current_score) if same_direction else result.current_score
-            self.storage.set_alert_state(
-                result.venue.id,
-                metric_type=result.observation.metric_type,
-                active=True,
-                last_alert_at=now,
-                last_score=result.current_score,
-                last_deviation=result.deviation_percent,
-                peak_score=peak,
-                direction=direction,
-            )
-
-
-def mark_state_from_observation(storage: BaseStorage, result: AnomalyResult) -> None:
-    """Track the extreme while a venue stays flagged between notifications."""
-    state = storage.alert_state(result.venue.id)
-    if not state.get("active"):
-        return
-    current_peak = float(state.get("peak_score") or 0.0)
-    if state.get("direction") == Direction.LOW.value:
-        peak = min(current_peak, result.current_score)
-    else:
-        peak = max(current_peak, result.current_score)
-    if peak != current_peak:
-        storage.set_alert_state(
-            result.venue.id,
-            metric_type=result.observation.metric_type,
-            active=True,
-            last_alert_at=state.get("last_alert_at"),
-            last_score=float(state.get("last_score") or 0.0),
-            last_deviation=float(state.get("last_deviation") or 0.0),
-            peak_score=peak,
-            direction=str(state.get("direction") or Direction.HIGH.value),
-        )
-

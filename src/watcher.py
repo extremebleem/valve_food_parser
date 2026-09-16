@@ -17,12 +17,11 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .anomaly import AnomalyDetector, compute_baseline
+from .anomaly import compute_baseline
 from .config import Settings
 from .logging_utils import get_logger, github_summary, set_output
 from .models import utcnow
-from .providers.base import ProviderError
-from .providers.watch_base import WatchProvider
+from .providers.base import ProviderError, WatchProvider
 from .storage import BaseStorage
 from .subjects import Subject, WatchEvent, WatchValue, default_subjects
 
@@ -78,7 +77,6 @@ class Watcher:
         self.storage = storage
         self.providers = list(providers)
         self.notifier = notifier
-        self.detector = AnomalyDetector(settings.anomaly)
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -86,7 +84,7 @@ class Watcher:
         try:
             from zoneinfo import ZoneInfo
 
-            return ZoneInfo(self.settings.office.timezone)
+            return ZoneInfo(self.settings.timezone)
         except Exception:  # pragma: no cover
             from datetime import timezone
 

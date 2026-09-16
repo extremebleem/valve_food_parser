@@ -1,5 +1,5 @@
-"""Pluggable discovery and load providers."""
+"""Providers that read the public state of a watched subject."""
 
-from .base import DiscoveryProvider, LoadProvider, ProviderError, ProviderUnavailable
+from .base import ProviderError, ProviderUnavailable, WatchProvider
 
-__all__ = ["DiscoveryProvider", "LoadProvider", "ProviderError", "ProviderUnavailable"]
+__all__ = ["WatchProvider", "ProviderError", "ProviderUnavailable"]

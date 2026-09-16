@@ -22,8 +22,7 @@ from ..http import HttpError, client_from_settings
 from ..logging_utils import get_logger
 from ..models import utcnow
 from ..subjects import Subject, SubjectKind, WatchValue
-from .base import ProviderError
-from .watch_base import WatchProvider
+from .base import ProviderError, WatchProvider
 
 log = get_logger(__name__)
 

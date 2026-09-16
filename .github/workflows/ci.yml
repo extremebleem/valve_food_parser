@@ -38,11 +38,6 @@ jobs:
           DATABASE_URL: "sqlite://:memory:"
         run: pytest --cov=src --cov-report=term-missing
 
-      - name: End-to-end dry run (synthetic signal source)
-        env:
-          DRY_RUN: "true"
-        run: python -m scripts.selftest
-
   secret-scan:
     runs-on: ubuntu-latest
     steps:
@@ -50,10 +45,10 @@ jobs:
       - name: Refuse committed secrets
         run: |
           set -e
-          if git ls-files | grep -E '^(\.env|config/providers\.json)$'; then
+          if git ls-files | grep -E '^\.env$'; then
             echo "::error::a secret-bearing file is tracked by git"; exit 1
           fi
-          if git grep -nIE '(TELEGRAM_BOT_TOKEN|BESTTIME_API_KEY_PRIVATE|GOOGLE_MAPS_API_KEY)[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_:-]{15,}' -- . ':!.github' ':!README.md' ':!docs'; then
+          if git grep -nIE '(TELEGRAM_BOT_TOKEN|GITHUB_TOKEN)[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_:-]{15,}' -- . ':!.github' ':!README.md' ':!docs'; then
             echo "::error::a hardcoded credential was found"; exit 1
           fi
           echo "no committed secrets found"

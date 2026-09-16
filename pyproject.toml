@@ -1,7 +1,7 @@
 [project]
-name = "valve-food-monitor"
+name = "valve-watch"
 version = "1.0.0"
-description = "Restaurant Demand Monitor for the area around Valve's HQ in Bellevue, WA"
+description = "Early warning for Valve updates, from public state only"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 

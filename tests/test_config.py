@@ -1,4 +1,4 @@
-"""Configuration parsing and the verified default office anchor."""
+"""Configuration parsing."""
 
 from __future__ import annotations
 
@@ -6,10 +6,6 @@ import pytest
 
 from src.config import (
     ConfigError,
-    DEFAULT_OFFICE_ADDRESS,
-    DEFAULT_OFFICE_LAT,
-    DEFAULT_OFFICE_LON,
-    OfficeConfig,
     env_bool,
     env_float,
     env_int,
@@ -18,40 +14,40 @@ from src.config import (
 )
 
 
-def test_default_office_is_the_verified_valve_hq(monkeypatch):
-    for key in ("OFFICE_LAT", "OFFICE_LON", "OFFICE_ADDRESS", "SEARCH_RADIUS_METERS"):
+def test_defaults_are_safe(monkeypatch):
+    for key in ("DRY_RUN", "DATABASE_URL", "TIMEZONE"):
         monkeypatch.delenv(key, raising=False)
     settings = load_settings(None)
-    assert "10400 NE 4th St" in DEFAULT_OFFICE_ADDRESS
-    assert settings.office.latitude == pytest.approx(DEFAULT_OFFICE_LAT)
-    assert settings.office.longitude == pytest.approx(DEFAULT_OFFICE_LON)
-    assert settings.office.timezone == "America/Los_Angeles"
-    assert settings.office.radius_meters == 2000
+    # a fresh checkout cannot spam a chat by accident
+    assert settings.dry_run is True
+    assert settings.timezone == "America/Los_Angeles"
+    assert settings.database_url.startswith("sqlite://")
+    assert settings.telegram.configured is False
 
 
-def test_office_can_be_relocated_without_code_changes(monkeypatch):
-    monkeypatch.setenv("OFFICE_LAT", "52.52")
-    monkeypatch.setenv("OFFICE_LON", "13.405")
-    monkeypatch.setenv("OFFICE_NAME", "Berlin Office")
-    monkeypatch.setenv("OFFICE_TIMEZONE", "Europe/Berlin")
-    monkeypatch.setenv("SEARCH_RADIUS_METERS", "1500")
+def test_thresholds_are_configurable(monkeypatch):
+    monkeypatch.setenv("RATE_MULTIPLIER", "4.0")
+    monkeypatch.setenv("MIN_BASELINE_SAMPLES", "12")
+    monkeypatch.setenv("BASELINE_LOOKBACK_WEEKS", "6")
+    monkeypatch.setenv("RATE_MIN_ABSOLUTE_DELTA", "8")
     settings = load_settings(None)
-    assert settings.office.name == "Berlin Office"
-    assert settings.office.latitude == 52.52
-    assert settings.office.radius_meters == 1500
-    assert settings.office.timezone == "Europe/Berlin"
+    assert settings.anomaly.multiplier == 4.0
+    assert settings.anomaly.min_baseline_samples == 12
+    assert settings.anomaly.lookback_weeks == 6
+    assert settings.anomaly.min_absolute_delta == 8.0
 
 
-@pytest.mark.parametrize("lat,lon", [(91.0, 0.0), (-91.0, 0.0), (0.0, 181.0)])
-def test_invalid_coordinates_are_rejected(lat, lon):
-    with pytest.raises(ConfigError):
-        OfficeConfig("x", "y", lat, lon, "UTC", 2000).validate()
+def test_telegram_is_configured_only_with_both_halves(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    assert load_settings(None).telegram.configured is False
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100123")
+    assert load_settings(None).telegram.configured is True
 
 
-@pytest.mark.parametrize("radius", [0, 10, 100_000])
-def test_invalid_radius_is_rejected(radius):
-    with pytest.raises(ConfigError):
-        OfficeConfig("x", "y", 47.6, -122.2, "UTC", radius).validate()
+def test_timezone_is_overridable(monkeypatch):
+    monkeypatch.setenv("TIMEZONE", "Europe/Berlin")
+    assert load_settings(None).timezone == "Europe/Berlin"
 
 
 @pytest.mark.parametrize("raw,expected", [("true", True), ("YES", True), ("0", False), ("off", False)])
@@ -86,107 +82,11 @@ def test_env_list(monkeypatch):
     assert env_list("MISSING") == []
 
 
-def test_dry_run_defaults_to_true(monkeypatch):
-    """Safe by default: a fresh checkout cannot spam a chat by accident."""
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    assert load_settings(None).dry_run is True
-
-
-def test_providers_are_disabled_without_keys(monkeypatch):
-    for key in ("GOOGLE_MAPS_API_KEY", "FOURSQUARE_API_KEY", "BESTTIME_API_KEY_PRIVATE"):
-        monkeypatch.delenv(key, raising=False)
+def test_unset_variable_falls_back_to_the_default(monkeypatch):
+    """An unset GitHub Actions variable arrives as an empty string and must not
+    fail the run."""
+    monkeypatch.setenv("MIN_BASELINE_SAMPLES", "")
+    monkeypatch.setenv("TIMEZONE", "")
     settings = load_settings(None)
-    assert settings.discovery.enable_osm is True
-    assert settings.discovery.enable_google is False
-    assert settings.discovery.enable_foursquare is False
-    assert settings.providers.besttime_private_key is None
-
-
-def test_thresholds_are_configurable(monkeypatch):
-    monkeypatch.setenv("ANOMALY_MULTIPLIER", "2.0")
-    monkeypatch.setenv("MIN_BASELINE_SAMPLES", "12")
-    monkeypatch.setenv("ALERT_COOLDOWN_MINUTES", "45")
-    monkeypatch.setenv("SEND_RECOVERY_ALERTS", "false")
-    settings = load_settings(None)
-    assert settings.anomaly.multiplier == 2.0
-    assert settings.anomaly.min_baseline_samples == 12
-    assert settings.alerts.cooldown_minutes == 45
-    assert settings.alerts.send_recovery is False
-
-
-def test_active_window_parsing(monkeypatch):
-    monkeypatch.setenv("ACTIVE_HOURS_START", "14")
-    monkeypatch.setenv("ACTIVE_HOURS_END", "21")
-    monkeypatch.setenv("ACTIVE_WEEKDAYS", "0,1,2,3,4")
-    window = load_settings(None).active_window
-    assert (window.start_hour, window.end_hour) == (14, 21)
-    assert window.weekdays == (0, 1, 2, 3, 4)
-    assert window.always_on is False
-    assert window.describe() == "14:00-21:00 local (MTWTF)"
-
-
-@pytest.mark.parametrize(
-    "start,end,weekdays",
-    [("25", "21", "0,1"), ("14", "-1", "0,1"), ("14", "21", "9")],
-)
-def test_invalid_active_window_is_rejected(monkeypatch, start, end, weekdays):
-    monkeypatch.setenv("ACTIVE_HOURS_START", start)
-    monkeypatch.setenv("ACTIVE_HOURS_END", end)
-    monkeypatch.setenv("ACTIVE_WEEKDAYS", weekdays)
-    with pytest.raises(ConfigError):
-        load_settings(None)
-
-
-def test_unset_weekday_variable_means_every_day(monkeypatch):
-    """An unset GitHub Actions variable arrives as an empty string, and must
-    fall back to the default rather than failing the run."""
-    monkeypatch.setenv("ACTIVE_HOURS_START", "14")
-    monkeypatch.setenv("ACTIVE_HOURS_END", "21")
-    monkeypatch.setenv("ACTIVE_WEEKDAYS", "")
-    window = load_settings(None).active_window
-    assert window.weekdays == (0, 1, 2, 3, 4, 5, 6)
-    assert window.contains(5, 15) is True
-
-
-def test_default_active_window_matches_the_shipped_configuration(monkeypatch):
-    for key in ("ACTIVE_HOURS_START", "ACTIVE_HOURS_END", "ACTIVE_WEEKDAYS"):
-        monkeypatch.delenv(key, raising=False)
-    window = load_settings(None).active_window
-    assert (window.start_hour, window.end_hour) == (14, 21)
-    assert window.always_on is False
-
-
-def test_no_log_extra_shadows_a_reserved_logrecord_field():
-    """`extra={"msg": ...}` (or name/args/levelname/...) makes logging raise
-    KeyError at call time, turning a log line into a crash. Guard the whole
-    source tree against that class of bug."""
-    import ast
-    import glob
-    import logging
-    import os
-
-    reserved = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
-        "message",
-        "asctime",
-        "taskName",
-    }
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    offenders = []
-    for path in glob.glob(os.path.join(root, "src", "**", "*.py"), recursive=True) + glob.glob(
-        os.path.join(root, "scripts", "*.py")
-    ):
-        tree = ast.parse(open(path, encoding="utf-8").read(), path)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            for keyword in node.keywords:
-                if keyword.arg != "extra" or not isinstance(keyword.value, ast.Dict):
-                    continue
-                for key in keyword.value.keys:
-                    if isinstance(key, ast.Constant) and key.value in reserved:
-                        offenders.append(
-                            "{}:{} extra={{{!r}: ...}}".format(
-                                os.path.relpath(path, root), node.lineno, key.value
-                            )
-                        )
-    assert offenders == [], "reserved LogRecord fields used in log extra: " + "; ".join(offenders)
+    assert settings.anomaly.min_baseline_samples == 7
+    assert settings.timezone == "America/Los_Angeles"

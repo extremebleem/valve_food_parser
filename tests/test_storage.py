@@ -1,15 +1,16 @@
-"""Persistence: upserts, the baseline query and its midnight wrap-around."""
+"""Persistence: subjects, watch state, numeric history and alert de-duplication."""
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 
-from src.models import AlertRecord, Baseline, BaselineStatus, Venue, make_venue_id, utcnow
-from src.storage import SQLiteStorage, PostgresStorage, StorageError, create_storage
+from src.models import AlertRecord, utcnow
+from src.storage import PostgresStorage, SQLiteStorage, StorageError, create_storage
+from src.subjects import Subject, WatchValue, default_subjects
 
-from .conftest import make_observation
+
+def value(subject, key, val, **kw):
+    return WatchValue(subject_id=subject.id, key=key, value=val, observed_at=utcnow(), **kw)
 
 
 def test_create_storage_selects_the_backend():
@@ -23,156 +24,102 @@ def test_create_storage_selects_the_backend():
         create_storage("")
 
 
-def test_venue_upsert_is_idempotent(storage, venue):
-    assert storage.upsert_venues([venue]) == {"inserted": 1, "updated": 0}
-    venue.name = "Din Tai Fung (Bellevue)"
-    assert storage.upsert_venues([venue]) == {"inserted": 0, "updated": 1}
-    stored = storage.get_venue(venue.id)
-    assert stored.name == "Din Tai Fung (Bellevue)"
-    assert stored.sources == ["osm"]
-    assert len(storage.list_venues()) == 1
+def test_subject_upsert_is_idempotent(storage):
+    subjects = default_subjects()
+    assert storage.upsert_subjects(subjects)["inserted"] == len(subjects)
+    assert storage.upsert_subjects(subjects) == {"inserted": 0, "updated": len(subjects)}
+    assert len(storage.list_subjects()) == len(subjects)
 
 
-def test_venues_round_trip_all_fields(storage):
-    original = Venue(
-        id=make_venue_id("Test", 47.6, -122.2),
-        name="Test",
-        address="1 Main",
-        latitude=47.6,
-        longitude=-122.2,
-        distance_meters=123.4,
-        category="pizzeria",
-        website="https://x.example",
-        phone="+1 555",
-        delivery=True,
-        takeaway=True,
-        sources=["osm", "google_places"],
-        cuisine="pizza",
-        opening_hours="Mo-Fr 08:00-17:00",
-        source_ids={"osm": "node/1"},
-    )
-    storage.upsert_venues([original])
-    stored = storage.get_venue(original.id)
-    assert stored.delivery is True and stored.takeaway is True
-    assert stored.sources == ["google_places", "osm"]
-    assert stored.source_ids == {"osm": "node/1"}
-    assert stored.distance_meters == 123.4
-
-
-def test_stale_venues_are_deactivated_not_deleted(storage, venue):
-    storage.upsert_venues([venue])
-    storage.execute(
-        "UPDATE venues SET last_seen = ? WHERE id = ?",
-        (storage.ts(utcnow() - timedelta(days=60)), venue.id),
-    )
-    storage.commit()
-    assert storage.deactivate_stale_venues(21) == 1
-    assert storage.list_venues(active_only=True) == []
-    assert len(storage.list_venues(active_only=False)) == 1
-
-
-def test_source_ids_are_merged_not_replaced(storage, venue):
-    storage.upsert_venues([venue])
-    storage.update_venue_source_ids(venue.id, {"besttime": "ven_123"})
-    storage.update_venue_source_ids(venue.id, {"pos": "abc"})
-    stored = storage.get_venue(venue.id)
-    assert stored.source_ids == {"osm": "", "besttime": "ven_123", "pos": "abc"} or (
-        stored.source_ids["besttime"] == "ven_123" and stored.source_ids["pos"] == "abc"
-    )
-    assert "besttime" in stored.sources
-
-
-def test_baseline_query_filters_by_venue_metric_weekday_and_slot(storage, venue):
-    storage.upsert_venues([venue])
-    rows = [
-        make_observation(venue.id, 40, minutes_ago=60 * 24 * 7, weekday=2, minutes=740),
-        make_observation(venue.id, 42, minutes_ago=60 * 24 * 14, weekday=2, minutes=790),
-        make_observation(venue.id, 99, minutes_ago=60 * 24 * 7, weekday=3, minutes=760),   # other day
-        make_observation(venue.id, 98, minutes_ago=60 * 24 * 7, weekday=2, minutes=1000),  # other slot
-        make_observation(
-            venue.id, 97, minutes_ago=60 * 24 * 7, weekday=2, minutes=760,
-            metric_type="delivery_eta_minutes",
-        ),  # other metric
-    ]
-    storage.insert_observations(rows)
-    samples = storage.fetch_baseline_samples(
-        venue.id, "live_busyness_index", 2, 760, window_minutes=60, lookback_weeks=8
-    )
-    assert sorted(samples) == [40.0, 42.0]
-
-
-def test_baseline_query_respects_the_lookback_horizon(storage, venue):
-    storage.upsert_venues([venue])
-    storage.insert_observations(
+def test_subjects_round_trip_and_sort_by_priority(storage):
+    storage.upsert_subjects(
         [
-            make_observation(venue.id, 40, minutes_ago=60 * 24 * 7),
-            make_observation(venue.id, 41, minutes_ago=60 * 24 * 365),  # a year ago
+            Subject.steam_app(730, "CS2", priority=50),
+            Subject.steam_feed(1675200, "SteamOS", priority=5),
         ]
     )
-    samples = storage.fetch_baseline_samples(
-        venue.id, "live_busyness_index", 2, 760, window_minutes=60, lookback_weeks=8
-    )
-    assert samples == [40.0]
+    listed = storage.list_subjects()
+    assert [s.priority for s in listed] == [5, 50]
+    assert listed[0].external_id == "1675200"
+    assert listed[0].url.startswith("https://")
 
 
-def test_baseline_window_wraps_across_midnight(storage):
-    """A 00:20 slot must pull 23:40 samples from the *previous* weekday."""
-    assert storage._slot_windows(0, 20, 60) == [(0, 0, 80), (6, 1400, 1439)]
-    assert storage._slot_windows(6, 1430, 60) == [(6, 1370, 1439), (0, 0, 50)]
-    assert storage._slot_windows(3, 720, 60) == [(3, 660, 780)]
+def test_inactive_subjects_are_filtered(storage):
+    storage.upsert_subjects([Subject.steam_app(730, "CS2", active=False)])
+    assert storage.list_subjects(active_only=True) == []
+    assert len(storage.list_subjects(active_only=False)) == 1
 
 
-def test_current_observation_is_excluded_from_its_own_baseline(storage, venue):
-    storage.upsert_venues([venue])
+def test_watch_value_round_trip_and_first_seen_is_preserved(storage):
+    subject = Subject.steam_app(730, "CS2")
+    storage.upsert_subjects([subject])
+    assert storage.get_watch_value(subject.id, "required_version") is None
+
+    storage.set_watch_value(value(subject, "required_version", "14181", label="1.41.8.1"))
+    first = storage.get_watch_value(subject.id, "required_version")
+    assert first["value"] == "14181" and first["label"] == "1.41.8.1"
+
+    storage.set_watch_value(value(subject, "required_version", "14205"))
+    second = storage.get_watch_value(subject.id, "required_version")
+    assert second["value"] == "14205"
+    # first_seen must survive the update: it is when we started watching
+    assert second["first_seen"] == first["first_seen"]
+
+
+def test_watch_events_are_appended(storage):
+    from src.subjects import WatchEvent
+
+    subject = Subject.steam_app(730, "CS2")
+    storage.upsert_subjects([subject])
+    assert storage.count_watch_events() == 0
+    for new in ("14190", "14205"):
+        storage.record_watch_event(WatchEvent(subject, "required_version", "14181", new))
+    assert storage.count_watch_events() == 2
+    recent = storage.recent_watch_events()
+    assert {r["new_value"] for r in recent} == {"14190", "14205"}
+
+
+def test_daily_series_keeps_one_value_per_day(storage):
+    subject = Subject.github_repo("ValveSoftware/gamescope")
+    storage.upsert_subjects([subject])
     now = utcnow()
-    current = make_observation(venue.id, 95)
-    current.timestamp = now
-    storage.insert_observations([make_observation(venue.id, 40, minutes_ago=60 * 24 * 7), current])
-    samples = storage.fetch_baseline_samples(
-        venue.id, "live_busyness_index", 2, 760, 60, 8, exclude_after=now
-    )
-    assert 95.0 not in samples
+    for v in (2, 7, 5):
+        storage.record_subject_value(subject.id, "commits_24h", v, now, "2026-09-10")
+    storage.record_subject_value(subject.id, "commits_24h", 4, now, "2026-09-11")
+    assert sorted(storage.daily_series(subject.id, "commits_24h")) == [4.0, 7.0]
 
 
-def test_baseline_upsert_replaces(storage, venue):
-    storage.upsert_venues([venue])
-    for median in (40.0, 55.0):
-        storage.upsert_baseline(
-            Baseline(venue.id, "m", 2, 760, 10, median, 2.0, 60.0, median, BaselineStatus.OK)
-        )
-    stored = storage.get_baseline(venue.id, "m", 2, 760)
-    assert stored.median == 55.0
-    assert storage.get_baseline(venue.id, "m", 3, 760) is None
+def test_daily_series_can_exclude_today(storage):
+    subject = Subject.github_repo("ValveSoftware/gamescope")
+    storage.upsert_subjects([subject])
+    now = utcnow()
+    storage.record_subject_value(subject.id, "commits_24h", 3, now, "2026-09-10")
+    storage.record_subject_value(subject.id, "commits_24h", 40, now, "2026-09-11")
+    assert storage.daily_series(subject.id, "commits_24h", exclude_day="2026-09-11") == [3.0]
 
 
-def test_alert_history_and_state(storage, venue):
-    storage.upsert_venues([venue])
-    assert storage.last_alert(venue.id) is None
-    assert storage.alert_state(venue.id)["active"] is False
+def test_numeric_history_can_be_purged(storage):
+    from datetime import timedelta
 
+    subject = Subject.github_repo("ValveSoftware/gamescope")
+    storage.upsert_subjects([subject])
+    storage.record_subject_value(subject.id, "c", 1, utcnow() - timedelta(days=400), "2025-01-01")
+    storage.record_subject_value(subject.id, "c", 2, utcnow(), "2026-09-17")
+    assert storage.purge_subject_observations(120) == 1
+    assert len(storage.daily_series(subject.id, "c", lookback_days=400)) == 1
+
+
+def test_alert_history_supports_deduplication(storage):
+    subject = Subject.steam_app(730, "CS2")
+    storage.upsert_subjects([subject])
+    assert storage.last_alert(subject.id) is None
     storage.record_alert(
-        AlertRecord(venue.id, "anomaly", 87, 54, 61.1, "live_busyness_index", utcnow(), "h1")
+        AlertRecord(subject.id, "watch", 0, 0, 0, "required_version", utcnow(), "hash-1")
     )
-    last = storage.last_alert(venue.id, "anomaly")
-    assert last.load_score == 87 and last.message_hash == "h1"
-
-    storage.set_alert_state(venue.id, active=True, last_alert_at=utcnow(), last_score=87, peak_score=91)
-    state = storage.alert_state(venue.id)
-    assert state["active"] is True and state["peak_score"] == 91
-
-
-def test_observations_can_be_purged(storage, venue):
-    storage.upsert_venues([venue])
-    storage.insert_observations(
-        [
-            make_observation(venue.id, 40, minutes_ago=60 * 24 * 400),
-            make_observation(venue.id, 41, minutes_ago=10),
-        ]
-    )
-    assert storage.purge_observations(90) == 1
-    assert storage.count_observations() == 1
+    last = storage.last_alert(subject.id, "watch")
+    assert last.message_hash == "hash-1"
+    assert storage.last_alert(subject.id, "other") is None
 
 
 def test_inserting_nothing_is_a_no_op(storage):
-    assert storage.insert_observations([]) == 0
-    assert storage.upsert_venues([]) == {"inserted": 0, "updated": 0}
+    assert storage.upsert_subjects([]) == {"inserted": 0, "updated": 0}
