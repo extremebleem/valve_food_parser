@@ -302,6 +302,28 @@ The extra gates exist because the headline ratio alone is not enough: a jump fro
 4 to 10 is `+150%` and completely uninteresting, and a venue that is busy by its
 own standards while still objectively quiet is not worth a notification.
 
+### Active window
+
+Monitoring only runs between `ACTIVE_HOURS_START` and `ACTIVE_HOURS_END` **in the
+office's local time** (`OFFICE_TIMEZONE`), defaulting to **14:00–21:00**. Outside
+it the run exits immediately having touched no API at all.
+
+The window is evaluated against the local wall clock rather than UTC, so it does
+not drift by an hour at each DST transition the way a UTC cron does. The cron in
+`monitor.yml` (`*/20 0-4,21-23 * * *`) is only the coarse filter — it spans the
+union of the window under both PDT and PST, and a cheap shell step skips the
+Python setup entirely on the ~3 ticks/day that fall outside. **24 ticks fire per
+day, 21 actually do work.**
+
+`ACTIVE_HOURS_START == ACTIVE_HOURS_END` disables the gate (24/7). The window may
+wrap midnight (`18`–`2`). `ACTIVE_WEEKDAYS` (0 = Monday) restricts it further;
+unset means every day.
+
+> The 14:00 default deliberately **excludes the lunch peak** (roughly
+> 11:30–13:30), which for an office food monitor is usually the most interesting
+> hour of the day. Set `ACTIVE_HOURS_START=11` to cover it — the cron already
+> spans enough UTC hours that no other change is needed.
+
 ### Anti-spam
 
 `alert_state` tracks whether each venue is currently in an alerting state, when
@@ -392,7 +414,8 @@ This calls `getChat` to prove the id resolves, then sends a real test message.
 `MIN_BASELINE_SAMPLES` · `BASELINE_LOOKBACK_WEEKS` · `BASELINE_WINDOW_MINUTES` ·
 `ALERT_COOLDOWN_MINUTES` · `SEND_RECOVERY_ALERTS` · `MAX_VENUES_PER_RUN` ·
 `ENABLE_GOOGLE_DISCOVERY` · `ENABLE_FOURSQUARE_DISCOVERY` · `VENUE_STALE_DAYS` ·
-`OBSERVATION_RETENTION_DAYS` (default 70)
+`OBSERVATION_RETENTION_DAYS` (default 70) · `ACTIVE_HOURS_START` (default 14) ·
+`ACTIVE_HOURS_END` (default 21) · `ACTIVE_WEEKDAYS`
 
 All are optional — every one has a default in [`src/config.py`](src/config.py).
 
@@ -479,7 +502,7 @@ invents busyness numbers.
 
 | Workflow | Schedule | Purpose |
 | --- | --- | --- |
-| `monitor.yml` | `*/20 * * * *` + manual | the monitoring pass |
+| `monitor.yml` | `*/20 0-4,21-23 * * *` + manual | the monitoring pass, gated to 14:00–21:00 office-local |
 | `discovery.yml` | `17 11 * * *` + manual | rebuild the venue list, upload a snapshot artifact |
 | `ci.yml` | push / PR | lint, tests, self-test, secret scan |
 
@@ -514,14 +537,14 @@ Measured against the real 248-venue dataset around the default office
 | 19:40 | 220 | 150 |
 | 22:40 | 162 | 150 |
 
-At the defaults (`MAX_VENUES_PER_RUN=150`, 72 runs/day) that is **~10 800
-BestTime credits/day ≈ 324 000/month**, which is far too much for a hobby
-deployment. **Tune this before going live.**
+The active window (14:00–21:00 office-local) means **21 effective runs/day**,
+not 72. At `MAX_VENUES_PER_RUN=150` that is **~3 150 BestTime credits/day
+≈ 94 500/month** — still the dominant cost, but ~3.4× below an ungated schedule.
 
 | Source | Calls/day (defaults) | Unit cost | Note |
 | --- | --- | --- | --- |
 | Overpass (discovery) | **1** | free | daily, not per run — the largest single saving in the design |
-| BestTime live | **~10 800** | 1 credit each | **the dominant cost**; see the levers below |
+| BestTime live | **~3 150** | 1 credit each | **the dominant cost**; see the levers below |
 | BestTime new forecasts | ≤ 10/run while onboarding, then ~0 | 2 credits | ~500 credits one-off for 248 venues |
 | Google Places Nearby (optional) | ~40 tiles × 1 run | ~$32/1000 Pro | ~$38/month, minus Google's monthly free credit |
 | Foursquare (optional) | ≤ 10 | 500 free Pro calls, then metered | ~$0 |
@@ -531,18 +554,16 @@ deployment. **Tune this before going live.**
 ### Recommended starter configuration
 
 ```env
+ACTIVE_HOURS_START=11              # covers the lunch peak as well as dinner
+ACTIVE_HOURS_END=21
 MAX_VENUES_PER_RUN=40
 ASSUME_OPEN_WHEN_UNKNOWN=false     # 41% of OSM venues here carry opening_hours
-```
-```yaml
-# .github/workflows/monitor.yml — only during eating hours, Pacific time
-schedule:
-  - cron: "*/20 14-23,0-6 * * *"
+STORE_RAW_VALUE=false              # halves database growth
 ```
 
-That combination polls ~40 venues over ~48 runs/day ≈ **1 900 credits/day**,
-roughly a **6× reduction**, while still covering breakfast, lunch and dinner for
-the nearest 40 venues.
+That polls ~40 venues over 30 runs/day ≈ **1 200 credits/day**, covering both
+lunch and dinner for the nearest 40 venues. No workflow edit is needed — the
+cron already spans the UTC hours these windows map to.
 
 | Lever | Measured effect |
 | --- | --- |
@@ -550,7 +571,7 @@ the nearest 40 venues.
 | `STORE_RAW_VALUE=false` | observation row 412 → **222 bytes** (−46% database growth) |
 | `ASSUME_OPEN_WHEN_UNKNOWN=false` | 150 → **87** venues polled at lunch (the 151 venues with no `opening_hours` are skipped) |
 | `MAX_VENUES_PER_RUN=40` | 150 → 40 venues per run |
-| cron `*/30`, or restricted to eating hours | 72 → 48 or 24 runs/day |
+| `ACTIVE_HOURS_START/END` (default 14–21) | 72 → **21** effective runs/day |
 | `BESTTIME_MAX_NEW_FORECASTS_PER_RUN` | caps the one-off onboarding spend |
 
 Discovery deliberately runs **daily, not every 20 minutes**.
@@ -566,19 +587,20 @@ horizon).
 
 | Configuration | Rows/day | Size at 70-day retention |
 | --- | --- | --- |
-| defaults (150 venues × 72 runs) | 10 800 | ~530 MB — **over a 500 MB free tier** |
-| starter (40 venues × 48 runs) | 1 920 | ~94 MB |
-| starter + `STORE_RAW_VALUE=false` | 1 920 | ~51 MB |
+| defaults (150 venues × 21 runs) | 3 150 | ~91 MB |
+| starter (40 venues × 30 runs) | 1 200 | ~35 MB |
+| starter + `STORE_RAW_VALUE=false` | 1 200 | ~19 MB |
 
 Supabase's free tier is 500 MB and pauses a project after 7 days without
 requests — the 20-minute cadence keeps it awake, but the size limit is real.
 
 ### GitHub Actions minutes
 
-Free minutes are **unlimited on public repositories**. On a **private** repo the
-Free plan gives 2 000 minutes/month, and this monitor uses roughly
-72 runs/day × ~1–1.5 min ≈ **3 000+ minutes/month** — it does not fit. Use a
-public repository, a less frequent cron, or a paid plan.
+Free minutes are unlimited on public repositories. On a **private** repo the
+Free plan gives **2 000 minutes/month**. With the active window this monitor uses
+21 full runs plus ~3 near-instant skips per day ≈ **770 minutes/month**, which
+fits comfortably. Widening the window is the thing to watch: an ungated
+`*/20 * * * *` schedule would need ~3 000 minutes and does **not** fit.
 
 ---
 
@@ -605,10 +627,14 @@ public repository, a less frequent cron, or a paid plan.
    never silently dropped because of a syntax the parser does not support.
 7. **Schedule drift.** GitHub's scheduler is best-effort; the ±60-minute baseline
    window absorbs it, but a heavily delayed run still samples a different moment.
-8. **Correlation, not causation.** A spike may be a Valve all-hands, a conference
+   A tick delayed past `ACTIVE_HOURS_END` is skipped rather than run late.
+8. **Nothing is learned outside the active window.** Baselines only ever exist
+   for slots that were sampled, so widening the window later starts a fresh
+   learning period for the newly covered hours.
+9. **Correlation, not causation.** A spike may be a Valve all-hands, a conference
    at the Hyatt across the street, a concert, or a panel-data artifact. The system
    reports that a venue is unusually busy; it does not explain why.
-9. **Timezone assumption.** All venues within the radius are assumed to share the
+10. **Timezone assumption.** All venues within the radius are assumed to share the
    office timezone. True at 2 km; revisit before using a very large radius.
 
 ### Possible improvements

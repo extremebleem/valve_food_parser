@@ -94,6 +94,11 @@ class Monitor:
             return False
         return oh.is_open(venue.opening_hours, moment.astimezone(self.tz))
 
+    def is_active_now(self, moment: datetime) -> bool:
+        """Is the office's local clock inside ACTIVE_HOURS_START..ACTIVE_HOURS_END?"""
+        local = moment.astimezone(self.tz)
+        return self.settings.active_window.contains(local.weekday(), local.hour)
+
     def select_venues(self, moment: datetime) -> Tuple[List[Venue], Dict[str, int]]:
         """Pick the venues worth spending API quota on this run."""
         venues = self.storage.list_venues(active_only=True)
@@ -181,6 +186,20 @@ class Monitor:
         started_wall = time.monotonic()
         started = utcnow()
         stats = RunStats()
+
+        # The window is checked first, deliberately: a tick outside the active
+        # hours must exit cleanly whatever else is (mis)configured, so ~3 of the
+        # 24 daily cron ticks can never turn the workflow red.
+        if not self.is_active_now(started):
+            local = started.astimezone(self.tz)
+            stats.skipped_reason = "outside active window {} (local {})".format(
+                self.settings.active_window.describe(), local.strftime("%a %H:%M %Z")
+            )
+            log.info("run skipped", extra={"reason": stats.skipped_reason})
+            print("skipped: " + stats.skipped_reason)
+            github_summary("### Restaurant Demand Monitor\n\nSkipped — " + stats.skipped_reason)
+            set_output("skipped", "true")
+            return stats
 
         if not self.providers:
             raise MonitorError(

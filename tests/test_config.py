@@ -112,3 +112,45 @@ def test_thresholds_are_configurable(monkeypatch):
     assert settings.anomaly.min_baseline_samples == 12
     assert settings.alerts.cooldown_minutes == 45
     assert settings.alerts.send_recovery is False
+
+
+def test_active_window_parsing(monkeypatch):
+    monkeypatch.setenv("ACTIVE_HOURS_START", "14")
+    monkeypatch.setenv("ACTIVE_HOURS_END", "21")
+    monkeypatch.setenv("ACTIVE_WEEKDAYS", "0,1,2,3,4")
+    window = load_settings(None).active_window
+    assert (window.start_hour, window.end_hour) == (14, 21)
+    assert window.weekdays == (0, 1, 2, 3, 4)
+    assert window.always_on is False
+    assert window.describe() == "14:00-21:00 local (MTWTF)"
+
+
+@pytest.mark.parametrize(
+    "start,end,weekdays",
+    [("25", "21", "0,1"), ("14", "-1", "0,1"), ("14", "21", "9")],
+)
+def test_invalid_active_window_is_rejected(monkeypatch, start, end, weekdays):
+    monkeypatch.setenv("ACTIVE_HOURS_START", start)
+    monkeypatch.setenv("ACTIVE_HOURS_END", end)
+    monkeypatch.setenv("ACTIVE_WEEKDAYS", weekdays)
+    with pytest.raises(ConfigError):
+        load_settings(None)
+
+
+def test_unset_weekday_variable_means_every_day(monkeypatch):
+    """An unset GitHub Actions variable arrives as an empty string, and must
+    fall back to the default rather than failing the run."""
+    monkeypatch.setenv("ACTIVE_HOURS_START", "14")
+    monkeypatch.setenv("ACTIVE_HOURS_END", "21")
+    monkeypatch.setenv("ACTIVE_WEEKDAYS", "")
+    window = load_settings(None).active_window
+    assert window.weekdays == (0, 1, 2, 3, 4, 5, 6)
+    assert window.contains(5, 15) is True
+
+
+def test_default_active_window_matches_the_shipped_configuration(monkeypatch):
+    for key in ("ACTIVE_HOURS_START", "ACTIVE_HOURS_END", "ACTIVE_WEEKDAYS"):
+        monkeypatch.delenv(key, raising=False)
+    window = load_settings(None).active_window
+    assert (window.start_hour, window.end_hour) == (14, 21)
+    assert window.always_on is False

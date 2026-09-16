@@ -317,6 +317,7 @@ class RunStats:
     alerts_suppressed: int = 0
     provider_errors: Dict[str, int] = field(default_factory=dict)
     duration_seconds: float = 0.0
+    skipped_reason: str = ""
 
     def as_logline(self) -> str:
         return (

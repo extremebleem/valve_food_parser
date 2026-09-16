@@ -34,6 +34,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--limit", type=int, help="override MAX_VENUES_PER_RUN (0 = no limit)"
     )
     parser.add_argument("--concurrency", type=int, default=6)
+    parser.add_argument(
+        "--ignore-window",
+        action="store_true",
+        help="run even outside ACTIVE_HOURS_START..END (for manual and local runs)",
+    )
     parser.add_argument("--purge-days", type=int, help="delete observations older than N days")
     parser.add_argument(
         "--purge-only", action="store_true", help="only run housekeeping, then exit"
@@ -56,6 +61,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings = dataclasses.replace(settings, dry_run=False)
     if args.limit is not None:
         settings = dataclasses.replace(settings, max_venues_per_run=int(args.limit))
+    if args.ignore_window:
+        settings = dataclasses.replace(
+            settings, active_window=dataclasses.replace(settings.active_window, start_hour=0, end_hour=0)
+        )
 
     setup_logging(settings.log_level, settings.log_format)
 

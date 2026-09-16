@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:  # optional: only used for local development
     from dotenv import load_dotenv
@@ -171,6 +171,54 @@ class AnomalyConfig:
 
 
 @dataclass(frozen=True)
+class ActiveWindowConfig:
+    """Hours of the day, in the *office's local time*, when monitoring runs.
+
+    Outside the window the run exits immediately without touching any API.
+    Evaluated against the office timezone rather than UTC, so the window does
+    not drift by an hour at each DST transition the way a UTC cron does.
+
+    ``start_hour == end_hour`` means "always on". A window may wrap midnight
+    (``start_hour=18, end_hour=2``).
+    """
+
+    # 14:00-21:00 office-local. NOTE: this excludes the lunch peak (~11:30-13:30);
+    # set ACTIVE_HOURS_START=11 to cover it.
+    start_hour: int = 14
+    end_hour: int = 21
+    weekdays: Tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
+
+    @property
+    def always_on(self) -> bool:
+        return self.start_hour == self.end_hour and len(self.weekdays) == 7
+
+    def validate(self) -> None:
+        for name, value in (("ACTIVE_HOURS_START", self.start_hour), ("ACTIVE_HOURS_END", self.end_hour)):
+            if not 0 <= value <= 24:
+                raise ConfigError("{} must be between 0 and 24, got {}".format(name, value))
+        if not self.weekdays:
+            raise ConfigError("ACTIVE_WEEKDAYS cannot be empty")
+        if any(not 0 <= d <= 6 for d in self.weekdays):
+            raise ConfigError("ACTIVE_WEEKDAYS must contain 0 (Mon) .. 6 (Sun)")
+
+    def contains(self, weekday: int, hour: int) -> bool:
+        """Is this local weekday/hour inside the window?"""
+        if weekday not in self.weekdays:
+            return False
+        if self.always_on or self.start_hour == self.end_hour:
+            return True
+        if self.start_hour < self.end_hour:
+            return self.start_hour <= hour < self.end_hour
+        return hour >= self.start_hour or hour < self.end_hour  # wraps midnight
+
+    def describe(self) -> str:
+        if self.always_on:
+            return "24/7"
+        days = "".join("MTWTFSS"[d] for d in sorted(self.weekdays))
+        return "{:02d}:00-{:02d}:00 local ({})".format(self.start_hour, self.end_hour, days)
+
+
+@dataclass(frozen=True)
 class AlertConfig:
     cooldown_minutes: int = 120
     # anti-flap: even after a venue recovered, do not re-alert sooner than this
@@ -215,6 +263,7 @@ class Settings:
     normalization: NormalizationConfig
     anomaly: AnomalyConfig
     alerts: AlertConfig
+    active_window: ActiveWindowConfig
     telegram: TelegramConfig
     providers: ProviderConfig
     database_url: str
@@ -334,6 +383,13 @@ def load_settings(env_file: Optional[str] = ".env", *, run_id: str = "") -> Sett
         aggregate=env_bool("AGGREGATE_ALERTS", True),
     )
 
+    active_window = ActiveWindowConfig(
+        start_hour=env_int("ACTIVE_HOURS_START", 14),
+        end_hour=env_int("ACTIVE_HOURS_END", 21),
+        weekdays=tuple(sorted({int(d) for d in env_list("ACTIVE_WEEKDAYS", "0,1,2,3,4,5,6")})),
+    )
+    active_window.validate()
+
     telegram = TelegramConfig(
         bot_token=env_str("TELEGRAM_BOT_TOKEN"),
         chat_id=env_str("TELEGRAM_CHAT_ID"),
@@ -363,6 +419,7 @@ def load_settings(env_file: Optional[str] = ".env", *, run_id: str = "") -> Sett
         normalization=normalization,
         anomaly=anomaly,
         alerts=alerts,
+        active_window=active_window,
         telegram=telegram,
         providers=providers,
         database_url=database_url,

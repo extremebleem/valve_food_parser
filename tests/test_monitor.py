@@ -77,8 +77,24 @@ def make_venue(name, *, hours="24/7", distance=100.0, status="OPERATIONAL"):
     )
 
 
-def build(settings, storage, providers, client=None):
-    return Monitor(settings, storage, providers=providers, notifier=Notifier(settings, storage, client=client or RecordingClient()))
+def build(settings, storage, providers, client=None, *, gate_time=False):
+    """Construct a Monitor for tests.
+
+    ``gate_time=False`` (the default) disables the active-hours window, so a
+    run-flow test never depends on what time of day the suite happens to run.
+    The window tests opt back in by passing an explicit ActiveWindowConfig.
+    """
+    if not gate_time:
+        settings = dataclasses.replace(
+            settings,
+            active_window=dataclasses.replace(settings.active_window, start_hour=0, end_hour=0),
+        )
+    return Monitor(
+        settings,
+        storage,
+        providers=providers,
+        notifier=Notifier(settings, storage, client=client or RecordingClient()),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -255,3 +271,132 @@ def test_raw_value_can_be_dropped_to_save_storage(settings, storage):
 
     fat = build(settings, storage, [provider])
     assert fat.to_observation(venue, signal, utcnow()).raw_value == {"venue_live_busyness": 70}
+
+
+# --------------------------------------------------------------------------- #
+# active window (office-local hours)
+# --------------------------------------------------------------------------- #
+
+
+def window(settings, start, end, weekdays=(0, 1, 2, 3, 4, 5, 6)):
+    from src.config import ActiveWindowConfig
+
+    return dataclasses.replace(
+        settings, active_window=ActiveWindowConfig(start, end, tuple(weekdays))
+    )
+
+
+@pytest.mark.parametrize(
+    "utc_hour,expected",
+    [
+        (13, False),  # 06:00 PDT
+        (18, False),  # 11:00 PDT -- lunch, deliberately outside a 14-21 window
+        (20, False),  # 13:00 PDT
+        (21, True),   # 14:00 PDT
+        (0, True),    # 17:00 PDT
+        (3, True),    # 20:00 PDT
+        (4, False),   # 21:00 PDT -- end is exclusive
+    ],
+)
+def test_active_window_uses_office_local_time(settings, storage, utc_hour, expected):
+    tuned = window(settings, 14, 21)
+    moment = datetime(2026, 7, 15, utc_hour, 30, tzinfo=timezone.utc)
+    monitor = build(tuned, storage, [StubProvider(tuned, {})], gate_time=True)
+    assert monitor.is_active_now(moment) is expected
+
+
+def test_active_window_survives_dst(settings, storage):
+    """The same local hour maps to different UTC hours in summer and winter."""
+    tuned = window(settings, 14, 21)
+    monitor = build(tuned, storage, [StubProvider(tuned, {})], gate_time=True)
+    summer = datetime(2026, 7, 15, 21, 30, tzinfo=timezone.utc)  # 14:30 PDT
+    winter = datetime(2026, 1, 14, 22, 30, tzinfo=timezone.utc)  # 14:30 PST
+    assert monitor.is_active_now(summer) is True
+    assert monitor.is_active_now(winter) is True
+    # and one hour earlier is outside the window in each regime
+    assert monitor.is_active_now(datetime(2026, 7, 15, 20, 30, tzinfo=timezone.utc)) is False
+    assert monitor.is_active_now(datetime(2026, 1, 14, 21, 30, tzinfo=timezone.utc)) is False
+
+
+def test_window_can_wrap_midnight(settings, storage):
+    tuned = window(settings, 18, 2)
+    monitor = build(tuned, storage, [StubProvider(tuned, {})], gate_time=True)
+    assert monitor.is_active_now(datetime(2026, 7, 16, 4, 0, tzinfo=timezone.utc)) is True   # 21:00
+    assert monitor.is_active_now(datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc)) is True   # 01:00
+    assert monitor.is_active_now(datetime(2026, 7, 16, 17, 0, tzinfo=timezone.utc)) is False  # 10:00
+
+
+def test_window_can_restrict_weekdays(settings, storage):
+    tuned = window(settings, 14, 21, weekdays=(0, 1, 2, 3, 4))
+    monitor = build(tuned, storage, [StubProvider(tuned, {})], gate_time=True)
+    assert monitor.is_active_now(datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc)) is True   # Wed
+    assert monitor.is_active_now(datetime(2026, 7, 18, 22, 0, tzinfo=timezone.utc)) is False  # Sat
+
+
+def test_equal_start_and_end_means_always_on(settings, storage):
+    tuned = window(settings, 0, 0)
+    monitor = build(tuned, storage, [StubProvider(tuned, {})], gate_time=True)
+    for utc_hour in range(0, 24, 3):
+        assert monitor.is_active_now(datetime(2026, 7, 15, utc_hour, tzinfo=timezone.utc)) is True
+
+
+def test_run_outside_the_window_touches_no_provider(settings, storage, monkeypatch):
+    """The whole point: zero API calls, zero cost, outside the window."""
+    storage.upsert_venues([make_venue("Cafe")])
+    tuned = window(settings, 14, 21)
+    provider = StubProvider(tuned, {"Cafe": 95})
+    client = RecordingClient()
+    monitor = build(tuned, storage, [provider], client, gate_time=True)
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "utcnow", lambda: datetime(2026, 7, 15, 13, 0, tzinfo=timezone.utc))
+    stats = monitor.run(concurrency=1)
+
+    assert "outside active window" in stats.skipped_reason
+    assert provider.calls == []
+    assert client.messages == []
+    assert stats.venues_checked == 0
+    assert storage.count_observations() == 0
+
+
+def test_run_inside_the_window_proceeds(settings, storage, monkeypatch):
+    storage.upsert_venues([make_venue("Cafe")])
+    tuned = window(settings, 14, 21)
+    provider = StubProvider(tuned, {"Cafe": 70})
+    monitor = build(tuned, storage, [provider], gate_time=True)
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "utcnow", lambda: datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc))
+    stats = monitor.run(concurrency=1)
+
+    assert stats.skipped_reason == ""
+    assert stats.venues_checked == 1
+
+
+def test_default_window_is_14_to_21_office_local(settings, storage):
+    """The shipped default matches .env.example and the workflow, so a local run
+    and a CI run behave identically."""
+    assert (settings.active_window.start_hour, settings.active_window.end_hour) == (14, 21)
+    monitor = build(settings, storage, [StubProvider(settings, {})], gate_time=True)
+    assert monitor.is_active_now(datetime(2026, 7, 15, 13, 0, tzinfo=timezone.utc)) is False  # 06:00
+    assert monitor.is_active_now(datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc)) is True   # 15:00
+
+
+def test_outside_the_window_a_misconfigured_run_still_exits_cleanly(settings, storage, monkeypatch):
+    """~3 of the 24 daily cron ticks land outside the window. They must never
+    turn the workflow red, whatever else is missing."""
+    tuned = window(settings, 14, 21)
+    monitor = build(tuned, storage, [], gate_time=True)  # no providers, no venues
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "utcnow", lambda: datetime(2026, 7, 15, 13, 0, tzinfo=timezone.utc))
+    stats = monitor.run(concurrency=1)
+    assert "outside active window" in stats.skipped_reason
+
+    # inside the window the same misconfiguration is still a systemic failure
+    monkeypatch.setattr(monitor_module, "utcnow", lambda: datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc))
+    with pytest.raises(MonitorError):
+        monitor.run(concurrency=1)
