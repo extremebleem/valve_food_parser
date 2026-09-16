@@ -161,7 +161,13 @@ class WatchNotifier:
             self.title_for(event),
             "<b>{}</b>".format(self.esc(event.subject.name)),
         ]
-        if event.label and event.key not in ("gc_deploy_in_flight", "cs2_scheduler", "cs2_services"):
+        # The label is suppressed where it merely restates the title, but a
+        # rollout in flight carries the version numbers there -- which is the
+        # most useful part of that notification, so it stays.
+        redundant = event.key in ("cs2_scheduler", "cs2_services") or (
+            event.key == "gc_deploy_in_flight" and str(event.new_value).lower() != "yes"
+        )
+        if event.label and not redundant:
             lines.append("<i>{}</i>".format(self.esc(event.label)))
         if event.key in (
             "required_version",

@@ -348,3 +348,29 @@ def test_service_event_message_shows_the_diff_not_the_whole_state(settings, stor
     assert "SessionsLogon: normal → delayed" in text
     # the unchanged service must not be repeated as if it were news
     assert "IEconItems: offline; SessionsLogon" not in text
+
+
+def test_a_rollout_in_flight_shows_the_version_numbers(settings, storage):
+    """The label carries "deploy 6691 against active 6689", which is the whole
+    point of that notification. Suppressing it as redundant lost it -- caught
+    on the first real alert this system produced."""
+    notifier = WatchNotifier(settings, storage, client=RecordingClient())
+    started = WatchEvent(
+        Subject.steam_app(1422450, "Deadlock"),
+        "gc_deploy_in_flight",
+        "no",
+        "yes",
+        label="идёт выкатка: deploy 6691 против active 6689",
+    )
+    text = "\n".join(notifier.render_event(started))
+    assert "6691" in text and "6689" in text
+
+    # once it lands the label only restates the title, so it stays suppressed
+    done = WatchEvent(
+        Subject.steam_app(1422450, "Deadlock"),
+        "gc_deploy_in_flight",
+        "yes",
+        "no",
+        label="выкатка не идёт",
+    )
+    assert "выкатка не идёт" not in "\n".join(notifier.render_event(done))
