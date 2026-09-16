@@ -81,6 +81,40 @@ CREATE TABLE IF NOT EXISTS alert_state (
     direction TEXT NOT NULL DEFAULT 'high'
 );
 
+CREATE TABLE IF NOT EXISTS subjects (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, external_id TEXT NOT NULL,
+    name TEXT NOT NULL, url TEXT DEFAULT '', active INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 100, meta TEXT DEFAULT '{}',
+    first_seen TEXT, last_seen TEXT
+);
+
+-- one row per (subject, watched key): what we saw last time
+CREATE TABLE IF NOT EXISTS watch_state (
+    subject_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    label TEXT DEFAULT '', detail TEXT DEFAULT '', url TEXT DEFAULT '',
+    first_seen TEXT, updated_at TEXT,
+    PRIMARY KEY (subject_id, key)
+);
+
+-- append-only log of every detected change
+CREATE TABLE IF NOT EXISTS watch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id TEXT NOT NULL, key TEXT NOT NULL,
+    old_value TEXT DEFAULT '', new_value TEXT NOT NULL,
+    label TEXT DEFAULT '', detail TEXT DEFAULT '', url TEXT DEFAULT '',
+    detected_at TEXT NOT NULL, notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS watch_events_idx ON watch_events (subject_id, detected_at DESC);
+
+-- history of numeric watch values (commit rates etc), for the baseline engine
+CREATE TABLE IF NOT EXISTS subject_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id TEXT NOT NULL, key TEXT NOT NULL, ts TEXT NOT NULL,
+    value REAL NOT NULL, local_day TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS subject_obs_idx
+    ON subject_observations (subject_id, key, ts DESC);
+
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT,
     kind TEXT NOT NULL, stats TEXT NOT NULL DEFAULT '{}'
@@ -579,6 +613,176 @@ class BaseStorage:
     def count_alerts_since(self, since: datetime) -> int:
         row = self.fetchone("SELECT COUNT(*) FROM alerts WHERE sent_at >= ?", (self.ts(since),))
         return int(row[0]) if row else 0
+
+
+    # -- subjects & watch state ------------------------------------------- #
+
+    SUBJECT_COLUMNS = "id, kind, external_id, name, url, active, priority, meta, first_seen, last_seen"
+
+    def upsert_subjects(self, subjects: Sequence[Any]) -> Dict[str, int]:
+        if not subjects:
+            return {"inserted": 0, "updated": 0}
+        existing = {row[0] for row in self.fetchall("SELECT id FROM subjects")}
+        now = utcnow()
+        inserted = updated = 0
+        for subject in subjects:
+            payload = (
+                subject.kind,
+                subject.external_id,
+                subject.name,
+                subject.url,
+                self.bool_true if subject.active else self.bool_false,
+                int(subject.priority),
+                json.dumps(subject.meta, ensure_ascii=False),
+                self.ts(now),
+            )
+            if subject.id in existing:
+                self.execute(
+                    "UPDATE subjects SET kind=?, external_id=?, name=?, url=?, active=?, "
+                    "priority=?, meta=?, last_seen=? WHERE id=?",
+                    payload + (subject.id,),
+                )
+                updated += 1
+            else:
+                self.execute(
+                    "INSERT INTO subjects ({}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".format(
+                        self.SUBJECT_COLUMNS
+                    ),
+                    (subject.id,) + payload[:7] + (self.ts(subject.first_seen or now), self.ts(now)),
+                )
+                inserted += 1
+        self.commit()
+        return {"inserted": inserted, "updated": updated}
+
+    def list_subjects(self, active_only: bool = True) -> List[Any]:
+        from .subjects import Subject
+
+        sql = "SELECT {} FROM subjects".format(self.SUBJECT_COLUMNS)
+        params: List[Any] = []
+        if active_only:
+            sql += " WHERE active = ?"
+            params.append(self.bool_true)
+        sql += " ORDER BY priority ASC, name ASC"
+        return [
+            Subject(
+                id=row[0],
+                kind=row[1],
+                external_id=row[2],
+                name=row[3],
+                url=row[4] or "",
+                active=bool(row[5]),
+                priority=int(row[6] or 100),
+                meta=json.loads(row[7] or "{}"),
+                first_seen=parse_iso(row[8]),
+                last_seen=parse_iso(row[9]),
+            )
+            for row in self.fetchall(sql, params)
+        ]
+
+    def get_watch_value(self, subject_id: str, key: str) -> Optional[Dict[str, Any]]:
+        row = self.fetchone(
+            "SELECT subject_id, key, value, label, detail, url, first_seen, updated_at "
+            "FROM watch_state WHERE subject_id = ? AND key = ?",
+            (subject_id, key),
+        )
+        if not row:
+            return None
+        return {
+            "subject_id": row[0],
+            "key": row[1],
+            "value": row[2],
+            "label": row[3] or "",
+            "detail": row[4] or "",
+            "url": row[5] or "",
+            "first_seen": parse_iso(row[6]),
+            "updated_at": parse_iso(row[7]),
+        }
+
+    def set_watch_value(self, value: Any) -> None:
+        previous = self.get_watch_value(value.subject_id, value.key)
+        self.execute(
+            "DELETE FROM watch_state WHERE subject_id = ? AND key = ?",
+            (value.subject_id, value.key),
+        )
+        self.execute(
+            "INSERT INTO watch_state (subject_id, key, value, label, detail, url, first_seen, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                value.subject_id,
+                value.key,
+                str(value.value),
+                value.label,
+                value.detail,
+                value.url,
+                self.ts((previous or {}).get("first_seen") or value.observed_at or utcnow()),
+                self.ts(value.observed_at or utcnow()),
+            ),
+        )
+        self.commit()
+
+    def record_watch_event(self, event: Any, notified: bool = False) -> None:
+        self.execute(
+            "INSERT INTO watch_events (subject_id, key, old_value, new_value, label, detail, "
+            "url, detected_at, notified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.subject.id,
+                event.key,
+                event.old_value,
+                event.new_value,
+                event.label,
+                event.detail,
+                event.url,
+                self.ts(event.detected_at or utcnow()),
+                self.bool_true if notified else self.bool_false,
+            ),
+        )
+        self.commit()
+
+    def count_watch_events(self) -> int:
+        row = self.fetchone("SELECT COUNT(*) FROM watch_events")
+        return int(row[0]) if row else 0
+
+    def recent_watch_events(self, limit: int = 20) -> List[Dict[str, Any]]:
+        rows = self.fetchall(
+            "SELECT subject_id, key, old_value, new_value, label, detected_at "
+            "FROM watch_events ORDER BY detected_at DESC LIMIT {}".format(int(limit))
+        )
+        return [
+            {
+                "subject_id": r[0],
+                "key": r[1],
+                "old_value": r[2],
+                "new_value": r[3],
+                "label": r[4],
+                "detected_at": parse_iso(r[5]),
+            }
+            for r in rows
+        ]
+
+
+    def record_subject_value(self, subject_id: str, key: str, value: float, moment: datetime,
+                             local_day: str) -> None:
+        self.execute(
+            "INSERT INTO subject_observations (subject_id, key, ts, value, local_day) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (subject_id, key, self.ts(moment), float(value), local_day),
+        )
+        self.commit()
+
+    def daily_series(self, subject_id: str, key: str, lookback_days: int = 28,
+                     exclude_day: Optional[str] = None) -> List[float]:
+        """One value per local day -- the day's peak reading.
+
+        A 24-hour rolling count sampled several times a day would otherwise put
+        the same event in the baseline repeatedly and flatten it.
+        """
+        cutoff = utcnow() - timedelta(days=max(1, lookback_days))
+        rows = self.fetchall(
+            "SELECT local_day, MAX(value) FROM subject_observations "
+            "WHERE subject_id = ? AND key = ? AND ts >= ? GROUP BY local_day ORDER BY local_day",
+            (subject_id, key, self.ts(cutoff)),
+        )
+        return [float(r[1]) for r in rows if exclude_day is None or r[0] != exclude_day]
 
     # -- runs -------------------------------------------------------------- #
 

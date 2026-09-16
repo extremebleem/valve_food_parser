@@ -1,0 +1,60 @@
+# Stage A(2) — Early-warning signals for a Valve update
+
+Checked live on 2026-09-17. Everything below is free, keyless and used through
+an official endpoint — no scraping, no third-party mirror.
+
+## The question
+
+Not "did Valve ship?" (that is trivially visible in the news feed after the
+fact) but **"is something coming?"** — enough warning to be ready.
+
+## What was tested
+
+| Signal | Endpoint | Key | Lead time | Verdict |
+| --- | --- | --- | --- | --- |
+| **Beta / preview channel posts** | `ISteamNews/GetNewsForApp` appid `1675200`, `753` | none | **days to weeks** | ✅ best lead time |
+| **Required game version** | `ISteamApps/UpToDateCheck` | none | minutes to hours before the blog post | ✅ precise, instant |
+| **GitHub tags / releases** | `api.github.com/repos/ValveSoftware/*` | none (1000/h with `GITHUB_TOKEN` in CI) | days | ✅ |
+| **GitHub commit bursts** | same | none | days | ✅ rate signal |
+| Depot buildid per branch | `api.steamcmd.net` | none | hours to days | ❌ mirror truncates every response at 16 256 of 35 865 bytes, on every retry and every combination of `--compressed` / `--http1.1`. Unusable. |
+| Depot buildid per branch | steamcmd / SteamKit anonymous PICS | none | hours to days | ⏳ the correct route (Valve's own protocol, anonymous login is supported), but it needs a dependency that could not be installed and therefore not verified here. Deliberately left out of v1. |
+| SteamDB | — | — | — | ❌ scraping prohibited by its terms |
+
+### Live readings at the time of writing
+
+```
+UpToDateCheck 730 -> required_version 14181  ("Server version required: 1.41.8.1")
+UpToDateCheck 570 -> required_version 37
+UpToDateCheck 440 -> required_version 10828683
+
+appid 1675200 news:
+  2026-09-14  SteamOS 3.9.1 Preview
+  2026-09-14  SteamOS 3.8.27 Beta
+  2026-09-11  Steam Beta Client Update: September 10th
+
+ValveSoftware on GitHub: 55 public repos, 8 pushed in the last 14 days,
+60 commits over those 14 days (48 of them in gamescope alone).
+```
+
+## Consequence for the design
+
+Two different mechanisms, not one:
+
+1. **Change detection on discrete state** — a watched value (required version,
+   latest tag, latest news id) changes -> alert immediately. This is what
+   answers "something is happening". No baseline, no statistics, no warm-up.
+2. **Rate anomalies** — commits/day, news items/week. These are continuous and
+   feed the existing median/MAD/robust-z engine unchanged.
+
+The old restaurant pipeline polled every 30 minutes because footfall changes
+that fast. Valve activity does not: roughly one public event per day. Discrete
+watchers are cheap enough to keep a short poll interval (they are free), while
+rate baselines move to daily buckets.
+
+## What this signal is and is not
+
+It observes **Valve directly** rather than a proxy, which is a large improvement
+over restaurant footfall. But the public GitHub org covers Proton, SteamOS and
+Linux tooling; CS2 and Dota development happens in private repositories. A beta
+channel post or a version bump is evidence that something **shipped or is about
+to ship**, not a measurement of how hard anyone is working.
