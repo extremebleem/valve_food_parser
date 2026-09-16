@@ -123,11 +123,27 @@ Full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### Storage
 
-A single `DATABASE_URL` pointing at **Postgres (Supabase / Neon / any provider)**.
-The runner is ephemeral and the monitor runs 14×/day, so committing a database
-back into git would mean a commit every half hour, races between overlapping runs
-and an ever-growing binary blob in history. `sqlite://` is supported for local
-development and the tests, through the same code path.
+The runner is ephemeral, so state has to live somewhere else. Two backends,
+chosen automatically, behind one `Storage` interface:
+
+| `DATABASE_URL` secret | Backend | Setup | Trade-off |
+| --- | --- | --- | --- |
+| **unset** (default) | SQLite inside a GitHub Actions **artifact** | none | expires with the artifact; quota-bound |
+| set | **Postgres** (Supabase / Neon / any) | one signup | durable, queryable from outside CI |
+
+With no `DATABASE_URL` the workflows restore `data/monitor.db.gz` from the
+artifact named `monitor-state` at the start of every run and re-upload it at the
+end with `overwrite: true`, so exactly one copy exists and the storage footprint
+stays flat. **This means the project deploys with no external service at all.**
+
+Committing the database back into git was never an option: the monitor runs
+14×/day, which would mean a commit every half hour, races between runs and an
+ever-growing binary blob in history. An artifact is not git and has none of
+those problems.
+
+Because `discovery` writes the venues table and `monitor` writes everything
+else, both workflows share the `concurrency: state` group so they can never
+interleave. See [`.github/workflows/_state.md`](.github/workflows/_state.md).
 
 Tables: `venues`, `observations`, `baselines`, `alerts`, `alert_state`, `runs`.
 
@@ -444,10 +460,10 @@ This calls `getChat` to prove the id resolves, then sends a real test message.
 
 | Secret | Required | Used by | What it is |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | **yes** | both workflows | `postgresql://user:password@host:5432/postgres?sslmode=require` |
 | `TELEGRAM_BOT_TOKEN` | **yes** | monitor | from BotFather |
 | `TELEGRAM_CHAT_ID` | **yes** | monitor | target chat |
 | `BESTTIME_API_KEY_PRIVATE` | **yes** | monitor | live busyness; without it there is no load signal |
+| `DATABASE_URL` | no | both workflows | `postgresql://user:password@host:5432/postgres?sslmode=require`. **Leave it unset** to keep state in a workflow artifact instead — no external service needed. |
 | `BESTTIME_API_KEY_PUBLIC` | no | monitor | read-only queries |
 | `GOOGLE_MAPS_API_KEY` | no | discovery | enables Google Places discovery |
 | `FOURSQUARE_API_KEY` | no | discovery | enables Foursquare discovery |
@@ -499,10 +515,12 @@ Useful flags:
 
 ### Deploying
 
-1. **Database.** Create a free Supabase or Neon project, copy the connection
-   string, and run `DATABASE_URL=... python -m scripts.init_db` once (the
-   workflows also migrate on every run, so this is optional).
-2. **Secrets.** Add the secrets from [§10](#10-github-secrets-and-variables).
+1. **Secrets.** Add the three required secrets from
+   [§10](#10-github-secrets-and-variables). Nothing else is needed — with no
+   `DATABASE_URL` the state lives in a workflow artifact.
+2. *(optional)* **External database.** For durable history, create a free
+   Supabase or Neon project and add its connection string as `DATABASE_URL`.
+   The workflows migrate on every run, so no manual setup is required.
 3. **Seed the venue list.** *Actions → discovery → Run workflow*.
 4. **Verify Telegram.** *Actions → monitor → Run workflow* with
    `dry_run = true`, and read the job summary.
@@ -689,10 +707,16 @@ would need ~3 000 minutes and does **not** fit.
 8. **Nothing is learned outside the active window.** Baselines only ever exist
    for slots that were sampled, so widening the window later starts a fresh
    learning period for the newly covered hours.
-9. **Correlation, not causation.** A spike may be a Valve all-hands, a conference
+9. **Artifact state is less durable than a database.** On the default backend,
+   history lives in an artifact with `retention-days: 7`: a repository left idle
+   for a week loses every baseline. `overwrite: true` also deletes before it
+   uploads, so a run killed in that window loses the live copy — `discovery`
+   therefore writes a dated backup once a day. Set `DATABASE_URL` if the history
+   matters.
+10. **Correlation, not causation.** A spike may be a Valve all-hands, a conference
    at the Hyatt across the street, a concert, or a panel-data artifact. The system
    reports that a venue is unusually busy; it does not explain why.
-10. **Timezone assumption.** All venues within the radius are assumed to share the
+11. **Timezone assumption.** All venues within the radius are assumed to share the
    office timezone. True at 2 km; revisit before using a very large radius.
 
 ### Possible improvements

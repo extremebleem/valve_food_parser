@@ -15,9 +15,12 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
+# discovery writes the venues table, monitor writes everything else. Same
+# database, so the two workflows must never interleave.
 concurrency:
-  group: discovery
+  group: state
   cancel-in-progress: false
 
 jobs:
@@ -37,9 +40,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Rebuild the venue list
+      - name: Choose the state backend
+        id: backend
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -n "${DATABASE_URL:-}" ]; then
+            echo "mode=postgres" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=artifact" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore state from the previous run
+        if: steps.backend.outputs.mode == 'artifact'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=monitor-state&per_page=100" \
+                --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+          if [ -z "$id" ]; then
+            echo "::notice::no previous state artifact -- starting with an empty database"
+            exit 0
+          fi
+          curl -sSL --fail-with-body \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" \
+            -o state.zip
+          unzip -oq state.zip -d data/
+          gunzip -f data/monitor.db.gz
+          echo "restored $(du -h data/monitor.db | cut -f1) of state from artifact $id"
+
+      - name: Rebuild the venue list
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL || 'sqlite:///data/monitor.db' }}
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           FOURSQUARE_API_KEY: ${{ secrets.FOURSQUARE_API_KEY }}
           OFFICE_NAME: ${{ vars.OFFICE_NAME }}
@@ -52,13 +88,39 @@ jobs:
           ENABLE_FOURSQUARE_DISCOVERY: ${{ vars.ENABLE_FOURSQUARE_DISCOVERY }}
           VENUE_STALE_DAYS: ${{ vars.VENUE_STALE_DAYS }}
           LOG_FORMAT: json
+          PYTHONUNBUFFERED: "1"
         run: |
           python -m scripts.discover \
             ${{ inputs.radius && format('--radius {0}', inputs.radius) || '' }} \
             --output venues.json
 
-      # An artifact, not a commit: the runtime database must never be written
-      # back into git, and this snapshot is only for humans to inspect.
+      - name: Compress state
+        if: steps.backend.outputs.mode == 'artifact' && always() && hashFiles('data/monitor.db') != ''
+        run: gzip -9 -c data/monitor.db > data/monitor.db.gz
+
+      - name: Persist state
+        if: steps.backend.outputs.mode == 'artifact' && always() && hashFiles('data/monitor.db.gz') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-state
+          path: data/monitor.db.gz
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+
+      # overwrite:true deletes before it uploads, so a run killed in that window
+      # would take the only copy with it. One dated snapshot per day is a cheap
+      # floor under that risk.
+      - name: Dated backup of the state
+        if: steps.backend.outputs.mode == 'artifact' && always() && hashFiles('data/monitor.db.gz') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-state-backup-${{ github.run_id }}
+          path: data/monitor.db.gz
+          retention-days: 14
+          if-no-files-found: warn
+
+      # A human-readable snapshot, not state: the venue list as JSON.
       - name: Upload venue snapshot
         uses: actions/upload-artifact@v4
         if: always()
