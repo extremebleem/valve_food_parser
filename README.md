@@ -256,6 +256,7 @@ Private chats have a positive id; groups and channels have a negative one.
 
 | Variable | Why |
 | --- | --- |
+| `WATCH_INTERVAL` · `WATCH_MAX_RUNTIME` | seconds between passes inside a job, and how long a job runs before chaining (default 300 / 3000) |
 | `TELEGRAM_HEARTBEAT_MIN_INTERVAL_MINUTES` | throttle the routine status message. At the `*/10` cadence leave this at **360** or the chat gets one every ten minutes |
 | `TIMEZONE` | used to bucket daily rate history; defaults to `America/Los_Angeles` |
 | `RATE_MULTIPLIER` · `MIN_BASELINE_SAMPLES` · `BASELINE_LOOKBACK_WEEKS` | commit-burst sensitivity |
@@ -306,12 +307,43 @@ python -m scripts.watch --show   # print the current stored state
 ## 9. Deploying
 
 1. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as repository secrets.
+   `STEAM_WEB_API_KEY` is optional but unlocks the CS2 matchmaking signal.
 2. **Actions** tab → enable workflows if prompted.
 3. **watch → Run workflow** with `dry_run = true`. The first run records a
    baseline and reports `first_seen=N, changes=0` — that is correct, not a
    failure.
-4. Run it once more with `dry_run = false`; from then on the schedule
-   (`7,37 * * * *`, twice an hour) takes over.
+4. Run it once more with `dry_run = false`.
+
+### Why the cadence does not use `schedule`
+
+GitHub's scheduler never fired for this repository. Over five hours with three
+different cron expressions, `event=schedule` stayed at `total_count=0` while
+manual dispatches succeeded every time — and the workflow was `active`, on the
+default branch, in a public, non-fork, non-archived repo. Every documented
+cause was ruled out.
+
+So each job **loops internally** for `WATCH_MAX_RUNTIME` seconds (default 3000,
+i.e. 50 minutes), running a pass every `WATCH_INTERVAL` seconds (default 300),
+and then **dispatches the next job itself**. The `schedule` trigger is kept as a
+second entry point in case it ever starts working; the `state` concurrency group
+makes an overlap harmless.
+
+Self-dispatch requires a **PAT**, because GitHub deliberately refuses to start a
+run from an event raised with the built-in `GITHUB_TOKEN`:
+
+| Secret | Scope |
+| --- | --- |
+| `WORKFLOW_CHAIN_TOKEN` | fine-grained PAT, this repository, **Actions: read and write** |
+
+Without it the job logs a warning and the chain simply stops, which is also how
+you turn the chain off. The hand-off runs even when a pass failed — otherwise
+one bad minute would end the chain permanently — but never sooner than five
+minutes after the job started, so a job that dies instantly cannot spin.
+
+> This keeps a free public runner occupied close to continuously (roughly 29
+> jobs a day at the defaults). Minutes are free on public repositories, but it
+> is worth being deliberate about it: raise `WATCH_INTERVAL` or lower
+> `WATCH_MAX_RUNTIME` if that is more than the signal is worth to you.
 
 Every run ends with a one-line summary and a table in the job summary:
 

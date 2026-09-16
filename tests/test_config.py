@@ -108,9 +108,12 @@ def test_the_workflow_sets_no_environment_variable_the_code_ignores():
     code = "\n".join(p.read_text() for p in (root / "src").rglob("*.py"))
 
     declared = set(re.findall(r"^\s{10}([A-Z][A-Z0-9_]+):", workflow, re.M))
+
     read = set(re.findall(r'env_(?:str|bool|int|float|list)\("([A-Z0-9_]+)"', config))
     read |= set(re.findall(r'environ\.get\("([A-Z0-9_]+)"', code))
-    # consumed by the runtime or the harness rather than by our own config
+    # some are consumed by the workflow's own shell rather than by Python
+    read |= set(re.findall(r"\$\{?([A-Z][A-Z0-9_]+)", workflow))
+    # and some by the runtime itself
     read |= {"GITHUB_TOKEN", "GH_TOKEN", "PYTHONUNBUFFERED"}
 
     assert declared, "no env block found -- has the workflow layout changed?"

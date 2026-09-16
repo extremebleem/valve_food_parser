@@ -1,9 +1,18 @@
 name: watch
 
-# Every five minutes -- the floor GitHub allows. Anything shorter is accepted
-# by the YAML parser and silently never fired, so */5 is as fast as a scheduled
-# workflow can go. Scheduling is best-effort in any case: runs are routinely
-# late and are sometimes skipped entirely, which nothing here assumes otherwise.
+# GitHub's scheduler has never fired for this repository: over five hours with
+# three different cron expressions, `event=schedule` stayed at total_count=0
+# while manual dispatches worked every time. The cadence therefore does not
+# depend on it.
+#
+# Instead each job loops internally for WATCH_MAX_RUNTIME seconds, checking
+# every WATCH_INTERVAL seconds, and then dispatches the next job itself. The
+# schedule below is kept as a second entry point in case it ever wakes up; the
+# `state` concurrency group makes an overlap harmless.
+#
+# Self-dispatch needs a PAT: GitHub deliberately refuses to start a new run
+# from an event raised with the built-in GITHUB_TOKEN, to prevent recursion.
+# Without WORKFLOW_CHAIN_TOKEN the job simply ends and the chain stops.
 #
 # The cadence is set by the cheapest, most valuable subject. Everything slower
 # carries its own min_interval_minutes (see src/subjects.py), so a typical run
@@ -35,8 +44,12 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 75
     steps:
+      - name: Record start time
+        id: started
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -125,6 +138,8 @@ jobs:
           # optional; unlocks the CS2 matchmaking/scheduler signal
           STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
           DELTA_ALERT_FRACTION: ${{ vars.DELTA_ALERT_FRACTION }}
+          WATCH_INTERVAL: ${{ vars.WATCH_INTERVAL || '300' }}
+          WATCH_MAX_RUNTIME: ${{ vars.WATCH_MAX_RUNTIME || '3000' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'America/Los_Angeles' }}
           RATE_MULTIPLIER: ${{ vars.RATE_MULTIPLIER }}
           RATE_MIN_ABSOLUTE_DELTA: ${{ vars.RATE_MIN_ABSOLUTE_DELTA }}
@@ -135,7 +150,11 @@ jobs:
           LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
           LOG_FORMAT: json
           PYTHONUNBUFFERED: "1"
-        run: python -m scripts.watch
+        run: |
+          python -m scripts.watch \
+            --loop \
+            --interval "${WATCH_INTERVAL:-300}" \
+            --max-runtime "${WATCH_MAX_RUNTIME:-3000}"
 
       - name: Compress state
         if: steps.backend.outputs.mode == 'artifact' && always() && hashFiles('data/monitor.db') != ''
@@ -150,3 +169,41 @@ jobs:
           retention-days: 30
           overwrite: true
           if-no-files-found: error
+
+      # Hand off to the next job. Runs even when the pass failed -- otherwise a
+      # single bad minute would end the chain permanently -- but never sooner
+      # than five minutes after this job started, so a job that dies instantly
+      # cannot spin.
+      - name: Chain the next run
+        if: always() && github.event_name != 'pull_request'
+        env:
+          CHAIN_TOKEN: ${{ secrets.WORKFLOW_CHAIN_TOKEN }}
+          STARTED_AT: ${{ steps.started.outputs.epoch }}
+        run: |
+          set -eu
+          if [ -z "${CHAIN_TOKEN:-}" ]; then
+            echo "::warning::WORKFLOW_CHAIN_TOKEN is not set -- the chain stops here."
+            echo "Create a fine-grained PAT with Actions: read and write on this"
+            echo "repository and add it as WORKFLOW_CHAIN_TOKEN, or trigger the"
+            echo "workflow manually. The built-in GITHUB_TOKEN cannot do this:"
+            echo "GitHub refuses to start a run from an event it raised."
+            exit 0
+          fi
+          elapsed=$(( $(date +%s) - ${STARTED_AT:-0} ))
+          floor=300
+          if [ "$elapsed" -lt "$floor" ]; then
+            echo "job lasted ${elapsed}s; waiting $(( floor - elapsed ))s before chaining"
+            sleep $(( floor - elapsed ))
+          fi
+          code=$(curl -sS -o /tmp/chain.json -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $CHAIN_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/watch.yml/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}")
+          if [ "$code" = "204" ]; then
+            echo "next run dispatched"
+          else
+            echo "::error::dispatch failed with HTTP $code: $(cat /tmp/chain.json)"
+            exit 1
+          fi

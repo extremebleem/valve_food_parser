@@ -569,3 +569,82 @@ def test_the_routine_message_reports_failed_sources(settings, storage):
     stats = make_watcher(settings, storage, {}, fail_for={subjects[0].name}).run()
     notifier = WatchNotifier(settings, storage, client=SilenceAwareClient())
     assert "источников не ответило: 1" in notifier.build_heartbeat(stats)
+
+
+# --------------------------------------------------------------------------- #
+# loop mode (the cadence, since GitHub's scheduler never fires here)
+# --------------------------------------------------------------------------- #
+
+
+class FakeClock:
+    """Advances only when the code under test sleeps, so a loop bounded by a
+    runtime budget finishes instantly instead of burning real seconds."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds)
+
+
+def loop_with(monkeypatch, run, interval=30, max_runtime=95):
+    import scripts.watch as cli
+
+    clock = FakeClock()
+
+    class StubWatcher:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            clock.now += 1.0  # a pass is not instantaneous
+            return run()
+
+    monkeypatch.setattr(cli, "Watcher", StubWatcher)
+    monkeypatch.setattr(cli, "build_providers", lambda s: [])
+    monkeypatch.setattr(cli, "WatchNotifier", lambda *a, **k: None)
+    monkeypatch.setattr(cli.time, "sleep", clock.sleep)
+    monkeypatch.setattr(cli.time, "monotonic", clock.monotonic)
+    args = type("A", (), {"interval": interval, "max_runtime": max_runtime})()
+    return cli, clock, args
+
+
+def test_loop_runs_repeatedly_until_the_budget_is_gone(settings, storage, monkeypatch):
+    calls = []
+    cli, clock, args = loop_with(monkeypatch, lambda: calls.append(1), interval=30, max_runtime=95)
+    assert cli.run_loop(settings, storage, args) == 0
+    assert len(calls) >= 3
+    assert clock.now <= 95
+
+
+def test_a_failing_iteration_does_not_end_the_loop(settings, storage, monkeypatch):
+    """The next pass is minutes away; one bad minute must not end the job."""
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("upstream blew up")
+
+    cli, _, args = loop_with(monkeypatch, flaky, interval=30, max_runtime=95)
+    assert cli.run_loop(settings, storage, args) == 0
+    assert len(attempts) >= 3
+
+
+def test_the_loop_gives_up_after_persistent_failure(settings, storage, monkeypatch):
+    def always_broken():
+        raise RuntimeError("always broken")
+
+    cli, _, args = loop_with(monkeypatch, always_broken, interval=30, max_runtime=100_000)
+    assert cli.run_loop(settings, storage, args) == 1
+
+
+def test_the_interval_has_a_floor(settings, storage, monkeypatch):
+    """A zero interval would otherwise spin the runner."""
+    cli, clock, args = loop_with(monkeypatch, lambda: None, interval=0, max_runtime=200)
+    assert cli.run_loop(settings, storage, args) == 0
+    # the floor is 30s, so a 200s budget cannot produce hundreds of passes
+    assert clock.now >= 30

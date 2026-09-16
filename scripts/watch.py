@@ -1,8 +1,14 @@
-"""One watch pass over Valve's public state.
+"""Watch Valve's public state.
 
-    python -m scripts.watch                 # honours DRY_RUN
+    python -m scripts.watch                 # one pass, honours DRY_RUN
     python -m scripts.watch --dry-run       # never touch Telegram
     python -m scripts.watch --show          # print current state and exit
+    python -m scripts.watch --loop --interval 300 --max-runtime 3000
+
+``--loop`` repeats the pass inside a single process until ``--max-runtime``
+elapses. It exists because GitHub's scheduler is unreliable -- on this
+repository it has never fired at all -- so the cadence is driven from inside
+one long job instead of by 288 separate scheduled runs.
 """
 
 from __future__ import annotations
@@ -10,6 +16,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import time
 from typing import List, Optional
 
 from src.config import ConfigError, load_settings
@@ -55,8 +62,67 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="force DRY_RUN=true")
     parser.add_argument("--send", action="store_true", help="force DRY_RUN=false")
     parser.add_argument("--show", action="store_true", help="print the stored state and exit")
+    parser.add_argument(
+        "--loop", action="store_true", help="keep running passes until --max-runtime elapses"
+    )
+    parser.add_argument(
+        "--interval", type=int, default=300, help="seconds between passes in --loop mode"
+    )
+    parser.add_argument(
+        "--max-runtime",
+        type=int,
+        default=3000,
+        help="stop looping after this many seconds (GitHub caps a job at 6 hours)",
+    )
     parser.add_argument("--env-file", default=".env")
     return parser.parse_args(argv)
+
+
+def run_loop(settings, storage, args) -> int:
+    """Repeat the pass until the runtime budget is gone.
+
+    Providers are rebuilt each iteration so nothing stale (an HTTP cache, a
+    resolved id) carries between passes. A failing iteration is logged and the
+    loop continues -- the whole point is that the next pass is only minutes
+    away, and one bad minute must not end the job.
+    """
+    deadline = time.monotonic() + max(1, args.max_runtime)
+    interval = max(30, args.interval)
+    iteration = 0
+    failures = 0
+
+    log.info(
+        "loop starting",
+        extra={"interval_s": interval, "budget_s": args.max_runtime},
+    )
+    while True:
+        iteration += 1
+        started = time.monotonic()
+        try:
+            Watcher(
+                settings,
+                storage,
+                build_providers(settings),
+                notifier=WatchNotifier(settings, storage),
+            ).run()
+        except Exception as exc:  # one bad pass must not end the job
+            failures += 1
+            log.exception("loop iteration failed", extra={"iteration": iteration})
+            if failures >= 10:
+                log.error("too many consecutive-ish failures, ending loop")
+                return 1
+        else:
+            failures = 0
+
+        remaining = deadline - time.monotonic()
+        if remaining <= interval:
+            log.info(
+                "loop finished",
+                extra={"iterations": iteration, "remaining_s": round(max(0.0, remaining))},
+            )
+            print("loop finished after {} iterations".format(iteration))
+            return 0
+        time.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -97,13 +163,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("\nсобытий в журнале: {}".format(storage.count_watch_events()))
                 return 0
 
-            watcher = Watcher(
+            if args.loop:
+                return run_loop(settings, storage, args)
+
+            Watcher(
                 settings,
                 storage,
                 build_providers(settings),
                 notifier=WatchNotifier(settings, storage),
-            )
-            watcher.run()
+            ).run()
     except StorageError as exc:
         print("storage failure: {}".format(exc), file=sys.stderr)
         return 2
