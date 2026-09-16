@@ -2,17 +2,17 @@ name: monitor
 
 # Scheduled runs on GitHub's shared runners are best-effort: they are frequently
 # delayed by several minutes and are occasionally skipped entirely during peak
-# load. Nothing in this system assumes an exact 20-minute cadence -- baselines
+# load. Nothing in this system assumes an exact 30-minute cadence -- baselines
 # are built from a +/-60 minute local-time window and cooldowns are measured
 # from real timestamps, so a late or missed run only costs one data point.
 # The cron is expressed in UTC and deliberately spans 0-4,21-23, which is the
 # union of 14:00-21:00 America/Los_Angeles under both PDT (UTC-7) and PST
 # (UTC-8). The precise window is enforced by ACTIVE_HOURS_START/END against the
 # office's local clock, so DST never shifts it: the cron is the coarse filter,
-# the code is the authority. 24 ticks/day fire, ~21 actually do work.
+# the code is the authority. 16 ticks/day fire, ~14 actually do work.
 on:
   schedule:
-    - cron: "*/20 0-4,21-23 * * *"
+    - cron: "*/30 0-4,21-23 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -114,7 +114,7 @@ jobs:
             ${{ github.event_name == 'workflow_dispatch' && '--ignore-window' || '' }}
 
       # Housekeeping: keep the observations table bounded. Runs on the hour
-      # only, so it costs nothing on the other 2 runs per hour.
+      # only, so it costs nothing on the other run in that hour.
       #
       # 70 days is BASELINE_LOOKBACK_WEEKS (8 weeks = 56 days) plus two weeks of
       # slack. Retaining longer buys nothing -- the baseline query never looks

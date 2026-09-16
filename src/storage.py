@@ -1,8 +1,8 @@
 """Persistence.
 
 Why an external SQL database and not a file committed back to the repository:
-a GitHub Actions runner is ephemeral, the monitor runs every 20 minutes, and
-committing a binary database on every run would produce ~72 commits/day, race
+a GitHub Actions runner is ephemeral, the monitor runs every 30 minutes, and
+committing a binary database on every run would produce dozens of commits a day, race
 between overlapping runs, and eventually make the repository unusable. A single
 ``DATABASE_URL`` secret pointed at a free Supabase/Neon Postgres keeps history
 outside CI, gives real indexes for the baseline query, and survives the runner.

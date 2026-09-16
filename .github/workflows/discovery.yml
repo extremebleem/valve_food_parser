@@ -2,7 +2,7 @@ name: discovery
 
 # The venue list is rebuilt once a day. Discovery is far more expensive than
 # monitoring (Overpass is a shared community resource, Google Places charges per
-# request) and venues do not open and close every 20 minutes.
+# request) and venues do not open and close every half hour.
 on:
   schedule:
     - cron: "17 11 * * *"   # 04:17 America/Los_Angeles in summer, 03:17 in winter

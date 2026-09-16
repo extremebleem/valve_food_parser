@@ -96,6 +96,6 @@ claim to count people.
    normalisation, alert gating and the CLI all work without one; only the live
    signal requires BestTime, and its absence is reported as a configuration error
    rather than silently faked.
-4. **Bounded API spend.** Discovery is daily, not every 20 minutes. Closed venues
+4. **Bounded API spend.** Discovery is daily, not every 30 minutes. Closed venues
    are never polled. `MAX_VENUES_PER_RUN` and `BESTTIME_MAX_NEW_FORECASTS_PER_RUN`
    cap the worst case.

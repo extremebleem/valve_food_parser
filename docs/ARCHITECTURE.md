@@ -11,8 +11,8 @@
                     │    ├─ FoursquareProvider      (optional)       │
                     │    └─ VenueMerger  ── dedupe ──▶ venues        │
                     │                                                │
-  monitor.yml  ────▶│  scripts.monitor       (every 20 minutes)      │
-   (cron: */20)     │    1. storage.list_venues(active)              │
+  monitor.yml  ────▶│  scripts.monitor    (every 30 min, 14-21 local)│
+   (cron: */30)     │    1. storage.list_venues(active)              │
                     │    2. opening_hours gate  ── skip closed ──▶   │
                     │    3. LoadProvider chain (besttime → generic)  │
                     │    4. Normalizer  raw metric ──▶ load_score    │
@@ -69,9 +69,9 @@ Python.
 
 ### Storage: external Postgres, not a file in git
 
-The runner is ephemeral and the monitor runs 72×/day. Committing a database back
-to the repository would mean ~72 commits/day, races between overlapping runs, an
-unreadable history and an ever-growing binary blob. Instead a single
+The runner is ephemeral and the monitor runs 14×/day. Committing a database back
+to the repository would mean a commit every half hour, races between overlapping
+runs, an unreadable history and an ever-growing binary blob. Instead a single
 `DATABASE_URL` secret points at a free-tier Supabase/Neon Postgres:
 
 * real indexes for the hot path — `(venue_id, metric_type, local_weekday, local_minutes, ts DESC)`;

@@ -44,7 +44,7 @@ that day of the week*.
 
 ## 1. What it does
 
-Every 20 minutes, for every venue within `SEARCH_RADIUS_METERS` of the office
+Every 30 minutes, for every venue within `SEARCH_RADIUS_METERS` of the office
 that is open right now:
 
 1. read whatever current-load signal is available;
@@ -96,7 +96,7 @@ valve-food-monitor/
 │   ├── discovery.py        fan-out + cross-source de-duplication
 │   ├── normalization.py    raw metric -> load_score 0..100
 │   ├── anomaly.py          median / MAD / p90 baseline, anomaly gates
-│   ├── monitor.py          the 20-minute run
+│   ├── monitor.py          the 30-minute run
 │   ├── telegram.py         gating, message rendering, Bot API
 │   └── providers/
 │       ├── base.py             DiscoveryProvider / LoadProvider ABCs
@@ -123,9 +123,9 @@ Full rationale in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### Storage
 
 A single `DATABASE_URL` pointing at **Postgres (Supabase / Neon / any provider)**.
-The runner is ephemeral and the monitor runs 72×/day, so committing a database
-back into git would mean ~72 commits/day, races between overlapping runs and an
-ever-growing binary blob in history. `sqlite://` is supported for local
+The runner is ephemeral and the monitor runs 14×/day, so committing a database
+back into git would mean a commit every half hour, races between overlapping runs
+and an ever-growing binary blob in history. `sqlite://` is supported for local
 development and the tests, through the same code path.
 
 Tables: `venues`, `observations`, `baselines`, `alerts`, `alert_state`, `runs`.
@@ -310,10 +310,10 @@ it the run exits immediately having touched no API at all.
 
 The window is evaluated against the local wall clock rather than UTC, so it does
 not drift by an hour at each DST transition the way a UTC cron does. The cron in
-`monitor.yml` (`*/20 0-4,21-23 * * *`) is only the coarse filter — it spans the
+`monitor.yml` (`*/30 0-4,21-23 * * *`) is only the coarse filter — it spans the
 union of the window under both PDT and PST, and a cheap shell step skips the
-Python setup entirely on the ~3 ticks/day that fall outside. **24 ticks fire per
-day, 21 actually do work.**
+Python setup entirely on the ~2 ticks/day that fall outside. **16 ticks fire per
+day, 14 actually do work.**
 
 `ACTIVE_HOURS_START == ACTIVE_HOURS_END` disables the gate (24/7). The window may
 wrap midnight (`18`–`2`). `ACTIVE_WEEKDAYS` (0 = Monday) restricts it further;
@@ -502,7 +502,7 @@ invents busyness numbers.
 
 | Workflow | Schedule | Purpose |
 | --- | --- | --- |
-| `monitor.yml` | `*/20 0-4,21-23 * * *` + manual | the monitoring pass, gated to 14:00–21:00 office-local |
+| `monitor.yml` | `*/30 0-4,21-23 * * *` + manual | the monitoring pass, gated to 14:00–21:00 office-local |
 | `discovery.yml` | `17 11 * * *` + manual | rebuild the venue list, upload a snapshot artifact |
 | `ci.yml` | push / PR | lint, tests, self-test, secret scan |
 
@@ -537,14 +537,15 @@ Measured against the real 248-venue dataset around the default office
 | 19:40 | 220 | 150 |
 | 22:40 | 162 | 150 |
 
-The active window (14:00–21:00 office-local) means **21 effective runs/day**,
-not 72. At `MAX_VENUES_PER_RUN=150` that is **~3 150 BestTime credits/day
-≈ 94 500/month** — still the dominant cost, but ~3.4× below an ungated schedule.
+A 30-minute cadence inside the active window (14:00–21:00 office-local) means
+**14 effective runs/day**, not 72. At `MAX_VENUES_PER_RUN=150` that is
+**~2 100 BestTime credits/day ≈ 63 000/month** — still the dominant cost, but
+~5× below an ungated 20-minute schedule.
 
 | Source | Calls/day (defaults) | Unit cost | Note |
 | --- | --- | --- | --- |
 | Overpass (discovery) | **1** | free | daily, not per run — the largest single saving in the design |
-| BestTime live | **~3 150** | 1 credit each | **the dominant cost**; see the levers below |
+| BestTime live | **~2 100** | 1 credit each | **the dominant cost**; see the levers below |
 | BestTime new forecasts | ≤ 10/run while onboarding, then ~0 | 2 credits | ~500 credits one-off for 248 venues |
 | Google Places Nearby (optional) | ~40 tiles × 1 run | ~$32/1000 Pro | ~$38/month, minus Google's monthly free credit |
 | Foursquare (optional) | ≤ 10 | 500 free Pro calls, then metered | ~$0 |
@@ -561,7 +562,7 @@ ASSUME_OPEN_WHEN_UNKNOWN=false     # 41% of OSM venues here carry opening_hours
 STORE_RAW_VALUE=false              # halves database growth
 ```
 
-That polls ~40 venues over 30 runs/day ≈ **1 200 credits/day**, covering both
+That polls ~40 venues over 20 runs/day ≈ **800 credits/day**, covering both
 lunch and dinner for the nearest 40 venues. No workflow edit is needed — the
 cron already spans the UTC hours these windows map to.
 
@@ -571,10 +572,10 @@ cron already spans the UTC hours these windows map to.
 | `STORE_RAW_VALUE=false` | observation row 412 → **222 bytes** (−46% database growth) |
 | `ASSUME_OPEN_WHEN_UNKNOWN=false` | 150 → **87** venues polled at lunch (the 151 venues with no `opening_hours` are skipped) |
 | `MAX_VENUES_PER_RUN=40` | 150 → 40 venues per run |
-| `ACTIVE_HOURS_START/END` (default 14–21) | 72 → **21** effective runs/day |
+| `ACTIVE_HOURS_START/END` (default 14–21) + `*/30` cron | 72 → **14** effective runs/day |
 | `BESTTIME_MAX_NEW_FORECASTS_PER_RUN` | caps the one-off onboarding spend |
 
-Discovery deliberately runs **daily, not every 20 minutes**.
+Discovery deliberately runs **daily, not every 30 minutes**.
 
 ### Database growth
 
@@ -587,20 +588,21 @@ horizon).
 
 | Configuration | Rows/day | Size at 70-day retention |
 | --- | --- | --- |
-| defaults (150 venues × 21 runs) | 3 150 | ~91 MB |
-| starter (40 venues × 30 runs) | 1 200 | ~35 MB |
-| starter + `STORE_RAW_VALUE=false` | 1 200 | ~19 MB |
+| defaults (150 venues × 14 runs) | 2 100 | ~61 MB |
+| starter (40 venues × 20 runs) | 800 | ~23 MB |
+| starter + `STORE_RAW_VALUE=false` | 800 | ~12 MB |
 
 Supabase's free tier is 500 MB and pauses a project after 7 days without
-requests — the 20-minute cadence keeps it awake, but the size limit is real.
+requests — the monitoring cadence keeps it awake, but the size limit is real.
 
 ### GitHub Actions minutes
 
 Free minutes are unlimited on public repositories. On a **private** repo the
-Free plan gives **2 000 minutes/month**. With the active window this monitor uses
-21 full runs plus ~3 near-instant skips per day ≈ **770 minutes/month**, which
-fits comfortably. Widening the window is the thing to watch: an ungated
-`*/20 * * * *` schedule would need ~3 000 minutes and does **not** fit.
+Free plan gives **2 000 minutes/month**. With the active window and a 30-minute
+cadence this monitor uses 14 full runs plus ~2 near-instant skips per day
+≈ **520 minutes/month**, which fits with room to spare. Widening the window or
+tightening the cron is the thing to watch: an ungated `*/20 * * * *` schedule
+would need ~3 000 minutes and does **not** fit.
 
 ---
 
