@@ -51,6 +51,10 @@ class BestTimeProvider(LoadProvider):
         self.allow_forecast = cfg.besttime_allow_forecast_as_load
         self.client = client_from_settings(settings, rate_limit_rps=cfg.besttime_rate_limit_rps)
         self.client.cache_ttl = 0  # live data must never be served from cache
+        # Creating a forecast is a heavy server-side operation that regularly
+        # takes longer than the default provider budget; measured read timeouts
+        # at 20s against besttime.app.
+        self.client.timeout = max(settings.http.timeout_seconds, 60.0)
         self.max_new_forecasts = int(os.environ.get("BESTTIME_MAX_NEW_FORECASTS_PER_RUN", "10"))
         self._new_forecasts_used = 0
         self._resolved: Dict[str, str] = {}
@@ -169,7 +173,11 @@ class BestTimeProvider(LoadProvider):
         if status not in {"OK", "SUCCESS", ""}:
             log.info(
                 "besttime status not OK",
-                extra={"venue": venue.name, "status": status, "msg": str(payload.get("message"))[:160]},
+                extra={
+                    "venue": venue.name,
+                    "status": status,
+                    "detail": str(payload.get("message"))[:160],
+                },
             )
             return None
 

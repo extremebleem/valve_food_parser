@@ -126,6 +126,10 @@ def test_overpass_address_assembly(settings):
 
 @pytest.mark.parametrize("payload", MALFORMED)
 def test_besttime_returns_none_for_malformed_payloads(settings, venue, payload):
+    import logging
+
+    # a real handler must actually format the record, or the bug stays hidden
+    logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
     assert bt(settings).parse_live(payload, venue) is None
 
 
@@ -163,6 +167,10 @@ def test_besttime_refuses_a_forecast_as_a_measurement_by_default(settings, venue
             "venue_forecast_busyness_available": True,
         },
     }
+    import logging
+
+    # a real handler must actually format the record, or the bug stays hidden
+    logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
     assert bt(settings).parse_live(payload, venue) is None
 
 
@@ -192,11 +200,19 @@ def test_besttime_forecast_fallback_is_opt_in_and_low_quality(settings, venue):
 
 def test_besttime_ignores_non_numeric_values(settings, venue):
     payload = {"analysis": {"venue_live_busyness": "very busy", "venue_live_busyness_available": True}}
+    import logging
+
+    # a real handler must actually format the record, or the bug stays hidden
+    logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
     assert bt(settings).parse_live(payload, venue) is None
 
 
 def test_besttime_honours_an_error_status(settings, venue):
     payload = {"status": "ERROR", "analysis": {"venue_live_busyness": 99}}
+    import logging
+
+    # a real handler must actually format the record, or the bug stays hidden
+    logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
     assert bt(settings).parse_live(payload, venue) is None
 
 
@@ -429,3 +445,19 @@ def test_missing_generic_config_is_not_an_error(settings):
         providers=dataclasses.replace(settings.providers, generic_config_path="/nonexistent/x.json"),
     )
     assert load_generic_providers(tuned) == []
+
+
+def test_besttime_logs_a_not_ok_status_without_crashing(settings, venue):
+    """Regression: `extra={"msg": ...}` collides with LogRecord.msg and raised
+    KeyError, which turned a routine "venue is closed" reply into a provider
+    failure. Found on a live run, not in the fixtures."""
+    payload = {
+        "status": "Error",
+        "message": "No live data available.",
+        "analysis": {"venue_live_busyness_available": False, "venue_forecasted_busyness": 0},
+    }
+    import logging
+
+    # a real handler must actually format the record, or the bug stays hidden
+    logging.getLogger("src.providers.besttime").setLevel(logging.INFO)
+    assert bt(settings).parse_live(payload, venue) is None

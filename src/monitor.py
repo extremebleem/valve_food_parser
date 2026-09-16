@@ -248,7 +248,9 @@ class Monitor:
                     failures[key] = failures.get(key, 0) + 1
                     continue
                 if observation is None:
-                    continue  # provider simply has no data for this venue
+                    # polled fine, the provider just has no reading for it
+                    stats.venues_no_data += 1
+                    continue
                 stats.venues_checked += 1
                 observations.append(observation)
 
@@ -359,7 +361,11 @@ class Monitor:
                 "venues_total": stats.venues_total,
                 "venues_open": stats.venues_open,
                 "venues_checked": stats.venues_checked,
+                "venues_no_data": stats.venues_no_data,
                 "venues_failed": stats.venues_failed,
+                "live_coverage_pct": (
+                    round(100.0 * stats.venues_checked / max(1, stats.venues_checked + stats.venues_no_data))
+                ),
                 "venues_learning": stats.venues_learning,
                 "anomalies": stats.anomalies,
                 "anomalies_low": stats.anomalies_low,

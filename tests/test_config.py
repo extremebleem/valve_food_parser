@@ -154,3 +154,39 @@ def test_default_active_window_matches_the_shipped_configuration(monkeypatch):
     window = load_settings(None).active_window
     assert (window.start_hour, window.end_hour) == (14, 21)
     assert window.always_on is False
+
+
+def test_no_log_extra_shadows_a_reserved_logrecord_field():
+    """`extra={"msg": ...}` (or name/args/levelname/...) makes logging raise
+    KeyError at call time, turning a log line into a crash. Guard the whole
+    source tree against that class of bug."""
+    import ast
+    import glob
+    import logging
+    import os
+
+    reserved = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+        "message",
+        "asctime",
+        "taskName",
+    }
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for path in glob.glob(os.path.join(root, "src", "**", "*.py"), recursive=True) + glob.glob(
+        os.path.join(root, "scripts", "*.py")
+    ):
+        tree = ast.parse(open(path, encoding="utf-8").read(), path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "extra" or not isinstance(keyword.value, ast.Dict):
+                    continue
+                for key in keyword.value.keys:
+                    if isinstance(key, ast.Constant) and key.value in reserved:
+                        offenders.append(
+                            "{}:{} extra={{{!r}: ...}}".format(
+                                os.path.relpath(path, root), node.lineno, key.value
+                            )
+                        )
+    assert offenders == [], "reserved LogRecord fields used in log extra: " + "; ".join(offenders)

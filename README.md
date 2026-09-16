@@ -562,10 +562,16 @@ restaurant or one failing provider is logged, counted and skipped.
 Every run ends with a one-line summary and a Markdown table in the job summary:
 
 ```
-venues_total=248 venues_open=57 venues_checked=54 venues_failed=3 \
-venues_learning=6 observations=54 anomalies=4 recoveries=1 \
-alerts_sent=1 alerts_suppressed=3 duration=41.2s
+venues_total=248 venues_open=57 venues_checked=54 venues_no_data=12 venues_failed=3 \
+venues_learning=6 observations=54 anomalies_high=4 anomalies_low=2 recoveries=1 \
+district_index=0.98 alerts_sent=1 alerts_suppressed=3 duration=41.2s
 ```
+
+`venues_no_data` is the one to watch: those are venues that were polled without
+error and for which the provider simply had no live reading. The job log also
+reports `live_coverage_pct` = `checked / (checked + no_data)`. If that stays low
+during the active window, the live signal does not cover this area densely
+enough for the approach to work, and no amount of threshold tuning will fix it.
 
 ---
 
@@ -661,8 +667,13 @@ would need ~3 000 minutes and does **not** fit.
    baselines, normalisation, alert gating, the CLI — works without one, but with
    no `BESTTIME_API_KEY_PRIVATE` and no declared generic provider there is
    nothing to measure, and the monitor says so instead of pretending.
-3. **Coverage is partial.** BestTime has no live data for some venues; those are
-   simply not observed.
+3. **Coverage is partial, and this is the main risk.** BestTime returns
+   `venue_live_busyness_available: false` for a venue whenever too few panel
+   devices are present. Measured on this deployment at ~07:00 local (a
+   deliberately bad hour): 0 of 5 open venues had a live reading, and only 2 of
+   6 attempted venues resolved to a BestTime venue id at all. Coverage must be
+   re-measured during the active window via `venues_no_data` /
+   `live_coverage_pct` before trusting any conclusion from this system.
 4. **Cold start.** Baselines need ~1–2 weeks before most venues leave
    `learning_baseline`. This is intentional.
 5. **Rare slots stay unbaselined.** A venue open only on Sunday evenings

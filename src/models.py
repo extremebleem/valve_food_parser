@@ -333,6 +333,9 @@ class RunStats:
     venues_open: int = 0
     venues_checked: int = 0
     venues_failed: int = 0
+    #: polled fine, but the provider simply has no live reading for them.
+    #: This is the number that decides whether the whole approach is viable.
+    venues_no_data: int = 0
     venues_learning: int = 0
     observations_written: int = 0
     anomalies: int = 0
@@ -347,13 +350,14 @@ class RunStats:
 
     def as_logline(self) -> str:
         return (
-            "venues_total={} venues_open={} venues_checked={} venues_failed={} "
+            "venues_total={} venues_open={} venues_checked={} venues_no_data={} venues_failed={} "
             "venues_learning={} observations={} anomalies_high={} anomalies_low={} "
             "recoveries={} district_index={:.2f} "
             "alerts_sent={} alerts_suppressed={} duration={:.1f}s".format(
                 self.venues_total,
                 self.venues_open,
                 self.venues_checked,
+                self.venues_no_data,
                 self.venues_failed,
                 self.venues_learning,
                 self.observations_written,

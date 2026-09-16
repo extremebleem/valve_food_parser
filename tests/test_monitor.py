@@ -400,3 +400,17 @@ def test_outside_the_window_a_misconfigured_run_still_exits_cleanly(settings, st
     monkeypatch.setattr(monitor_module, "utcnow", lambda: datetime(2026, 7, 15, 22, 0, tzinfo=timezone.utc))
     with pytest.raises(MonitorError):
         monitor.run(concurrency=1)
+
+
+def test_venues_without_a_reading_are_counted_separately_from_failures(settings, storage):
+    """Live-signal coverage is the number that decides whether the approach is
+    viable, so "no data" must not hide inside "checked" or "failed"."""
+    storage.upsert_venues(
+        [make_venue("Has Data"), make_venue("No Data", distance=200), make_venue("Broken", distance=300)]
+    )
+    provider = StubProvider(settings, {"Has Data": 70}, fail_for=["Broken"])
+    stats = build(settings, storage, [provider]).run(concurrency=1)
+    assert stats.venues_checked == 1
+    assert stats.venues_no_data == 1
+    assert stats.venues_failed == 1
+    assert "venues_no_data=1" in stats.as_logline()
