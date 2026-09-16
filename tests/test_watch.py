@@ -68,11 +68,11 @@ def test_watch_list_is_not_empty_and_has_no_duplicate_ids():
     assert len({s.id for s in subjects}) == len(subjects)
 
 
-def test_the_highest_priority_subject_is_the_beta_channel():
-    """SteamOS previews are the signal with the longest lead time."""
-    first = sorted(default_subjects(), key=lambda s: s.priority)[0]
-    assert first.kind == SubjectKind.STEAM_FEED
-    assert "1675200" == first.external_id
+def test_priority_order_puts_cs2_first_then_the_beta_channel():
+    """CS2 is the focus; the SteamOS preview feed is the longest-lead signal."""
+    order = [s.external_id for s in sorted(default_subjects(), key=lambda s: s.priority)]
+    assert order[0] == "730"
+    assert order[1] == "1675200"
 
 
 def test_appid_753_is_not_watched():
@@ -374,3 +374,62 @@ def test_message_escapes_html(settings, storage):
     text = notifier.build([WatchEvent(subject, "latest_news", "a", "b", label="<script>")], [])
     assert "<script>" not in text
     assert "&lt;script&gt;" in text
+
+
+# --------------------------------------------------------------------------- #
+# sharp moves on constantly-changing counters
+# --------------------------------------------------------------------------- #
+
+
+def test_a_sharp_drop_is_flagged(settings, storage):
+    """A player-count collapse is what a server restart looks like."""
+    subject = Subject.steam_app(730, "CS2", meta={"watch_players": True})
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+
+    assert watcher.check_delta(subject, value(subject, "players_current", "1450000")) is None
+    hit = watcher.check_delta(subject, value(subject, "players_current", "1186514"))
+    assert hit is not None
+    assert hit["change"] < -0.15
+    assert hit["previous"] == 1450000.0
+
+
+def test_a_small_move_is_not_flagged(settings, storage):
+    subject = Subject.steam_app(730, "CS2", meta={"watch_players": True})
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+    watcher.check_delta(subject, value(subject, "players_current", "1000000"))
+    assert watcher.check_delta(subject, value(subject, "players_current", "1050000")) is None
+
+
+def test_a_sharp_rise_is_flagged_too(settings, storage):
+    subject = Subject.steam_app(730, "CS2", meta={"watch_players": True})
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+    watcher.check_delta(subject, value(subject, "players_current", "1000000"))
+    hit = watcher.check_delta(subject, value(subject, "players_current", "1400000"))
+    assert hit is not None and hit["change"] > 0.15
+
+
+def test_tiny_counters_are_ignored(settings, storage):
+    """Relative moves on small numbers are noise: 3 -> 6 is +100% and means
+    nothing."""
+    subject = Subject.github_repo("ValveSoftware/gamescope")
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+    watcher.check_delta(subject, value(subject, "cs2_online_servers", "3"))
+    assert watcher.check_delta(subject, value(subject, "cs2_online_servers", "6")) is None
+
+
+def test_delta_needs_a_previous_reading(settings, storage):
+    subject = Subject.steam_app(730, "CS2", meta={"watch_players": True})
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+    assert watcher.check_delta(subject, value(subject, "players_current", "999999")) is None
+
+
+def test_a_non_numeric_delta_is_ignored(settings, storage):
+    subject = Subject.steam_app(730, "CS2", meta={"watch_players": True})
+    storage.upsert_subjects([subject])
+    watcher = make_watcher(settings, storage, {})
+    assert watcher.check_delta(subject, value(subject, "players_current", "n/a")) is None

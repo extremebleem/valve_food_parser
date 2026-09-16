@@ -20,15 +20,35 @@ from .telegram import MessageBuilder, TelegramClient, plural_ru
 log = get_logger(__name__)
 
 KEY_TITLES = {
-    "required_version": "🧩 Версия сервера изменилась",
+    "gc_deploy_in_flight": "🚀 Выкатка идёт прямо сейчас",
+    "cs2_scheduler": "🎯 Матчмейкинг CS2 сменил состояние",
+    "cs2_services": "🛠 Сервисы CS2 сменили состояние",
     "latest_prerelease": "🧪 Новый пре-релизный билд",
-    "latest_news": "📰 Официальный пост",
+    "sdr_pops": "🌐 Изменился состав релейных дата-центров",
+    "sdr_revision": "🛰 Обновлён конфиг сети CS2",
+    "required_version": "🧩 Версия сервера изменилась",
+    "cs2_app_version": "🧩 Версия CS2 изменилась",
+    "gc_active_version": "🧩 Версия game coordinator изменилась",
     "latest_release": "🏷 Новый релиз",
+    "latest_news": "📰 Официальный пост",
 }
 
-#: A pre-release post is the whole point of this project: it is the signal with
-#: the longest lead time over a stable update.
-PRIORITY = {"latest_prerelease": 0, "required_version": 1, "latest_release": 2, "latest_news": 3}
+#: Ordered by how much warning the signal gives. A deploy in flight and a
+#: matchmaking state change are happening *now*; a pre-release post and a
+#: datacenter change are days out. Both ends matter more than the middle.
+PRIORITY = {
+    "gc_deploy_in_flight": 0,
+    "cs2_scheduler": 1,
+    "cs2_services": 2,
+    "latest_prerelease": 3,
+    "sdr_pops": 4,
+    "sdr_revision": 5,
+    "cs2_app_version": 6,
+    "required_version": 7,
+    "gc_active_version": 8,
+    "latest_release": 9,
+    "latest_news": 10,
+}
 
 
 def event_hash(event: WatchEvent) -> str:
@@ -54,27 +74,62 @@ class WatchNotifier:
     def esc(self, text: Any) -> str:
         return MessageBuilder.esc(text)
 
+    @staticmethod
+    def title_for(event: WatchEvent) -> str:
+        """Title depends on the new value, not only on the key.
+
+        ``gc_deploy_in_flight`` going yes->no means a rollout *finished*, which
+        is different news from one starting; titling both "a rollout is in
+        flight" was simply wrong.
+        """
+        value = str(event.new_value).strip().lower()
+        if event.key == "gc_deploy_in_flight":
+            return (
+                "🚀 Выкатка идёт прямо сейчас" if value == "yes" else "✅ Выкатка завершилась"
+            )
+        if event.key == "cs2_scheduler":
+            return (
+                "🎯 Матчмейкинг CS2 вернулся в норму"
+                if value == "normal"
+                else "🎯 Матчмейкинг CS2: {}".format(value)
+            )
+        if event.key == "cs2_services":
+            degraded = [
+                part for part in value.split(",") if part and not part.endswith("=normal")
+            ]
+            return (
+                "🛠 Сервисы CS2 вернулись в норму"
+                if not degraded
+                else "🛠 Сервисы CS2: проблемы"
+            )
+        return KEY_TITLES.get(event.key, "🔔 Изменение")
+
     def render_event(self, event: WatchEvent) -> List[str]:
         lines = [
-            "{}".format(KEY_TITLES.get(event.key, "🔔 Изменение")),
+            self.title_for(event),
             "<b>{}</b>".format(self.esc(event.subject.name)),
         ]
-        if event.label:
+        if event.label and event.key not in ("gc_deploy_in_flight", "cs2_scheduler", "cs2_services"):
             lines.append("<i>{}</i>".format(self.esc(event.label)))
-        if event.key == "required_version":
+        if event.key in ("required_version", "cs2_app_version", "gc_active_version"):
             lines.append("<code>{} → {}</code>".format(self.esc(event.old_value), self.esc(event.new_value)))
         if event.detail:
             lines.append(self.esc(event.detail))
         lead = LEAD_TIME.get(event.key)
-        if lead:
+        if lead and not (event.key == "gc_deploy_in_flight" and event.new_value != "yes"):
             lines.append("⏱ типичная фора: {}".format(lead))
         if event.url:
             lines.append('🔗 <a href="{}">открыть</a>'.format(self.esc(event.url)))
         return lines
 
-    def build(self, events: Sequence[WatchEvent], rate_hits: Sequence[Dict[str, Any]]) -> str:
-        ordered = sorted(events, key=lambda e: (PRIORITY.get(e.key, 9), e.subject.priority))
-        total = len(ordered) + len(rate_hits)
+    def build(
+        self,
+        events: Sequence[WatchEvent],
+        rate_hits: Sequence[Dict[str, Any]],
+        delta_hits: Sequence[Dict[str, Any]] = (),
+    ) -> str:
+        ordered = sorted(events, key=lambda e: (PRIORITY.get(e.key, 99), e.subject.priority))
+        total = len(ordered) + len(rate_hits) + len(delta_hits)
         parts = [
             "⚡ <b>У Valve что-то происходит</b>",
             "<i>{} {} · {}</i>".format(
@@ -87,6 +142,22 @@ class WatchNotifier:
         for event in ordered:
             parts.extend(self.render_event(event))
             parts.append("")
+
+        if delta_hits:
+            parts.append("📊 <b>Резкое изменение</b>")
+            for hit in delta_hits:
+                arrow = "📉" if hit["change"] < 0 else "📈"
+                parts.append(
+                    "{} <b>{}</b> — {:+.0f}%".format(
+                        arrow, self.esc(hit["subject"].name), hit["change"] * 100.0
+                    )
+                )
+                parts.append(
+                    "    <i>{:,.0f} → {:,.0f} · {}</i>".format(
+                        hit["previous"], hit["current"], self.esc(hit["key"])
+                    ).replace(",", " ")
+                )
+                parts.append("")
 
         if rate_hits:
             parts.append("📈 <b>Всплеск активности</b>")
@@ -111,7 +182,12 @@ class WatchNotifier:
 
     # -- delivery ---------------------------------------------------------- #
 
-    def notify(self, events: Sequence[WatchEvent], rate_hits: Sequence[Dict[str, Any]]) -> int:
+    def notify(
+        self,
+        events: Sequence[WatchEvent],
+        rate_hits: Sequence[Dict[str, Any]],
+        delta_hits: Sequence[Dict[str, Any]] = (),
+    ) -> int:
         fresh: List[WatchEvent] = []
         for event in events:
             if event.first_ever:
@@ -126,10 +202,10 @@ class WatchNotifier:
                 continue
             fresh.append(event)
 
-        if not fresh and not rate_hits:
+        if not fresh and not rate_hits and not delta_hits:
             return 0
 
-        text = self.build(fresh, rate_hits)
+        text = self.build(fresh, rate_hits, delta_hits)
         delivered = self.client.send_message(text)
 
         for event in fresh:
@@ -146,4 +222,4 @@ class WatchNotifier:
                     delivered=delivered,
                 )
             )
-        return (len(fresh) + len(rate_hits)) if delivered else 0
+        return (len(fresh) + len(rate_hits) + len(delta_hits)) if delivered else 0

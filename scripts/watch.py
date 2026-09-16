@@ -14,6 +14,12 @@ from typing import List, Optional
 
 from src.config import ConfigError, load_settings
 from src.logging_utils import get_logger, setup_logging
+from src.providers.cs2 import (
+    CS2ServerStatusProvider,
+    SteamGCVersionProvider,
+    SteamPlayerCountProvider,
+    SteamSDRProvider,
+)
 from src.providers.github import GitHubProvider
 from src.providers.steam import SteamNewsProvider, SteamVersionProvider
 from src.storage import StorageError, create_storage
@@ -24,7 +30,20 @@ log = get_logger(__name__)
 
 
 def build_providers(settings):
-    return [SteamVersionProvider(settings), SteamNewsProvider(settings), GitHubProvider(settings)]
+    providers = [
+        SteamVersionProvider(settings),
+        SteamNewsProvider(settings),
+        SteamSDRProvider(settings),
+        SteamGCVersionProvider(settings),
+        SteamPlayerCountProvider(settings),
+        CS2ServerStatusProvider(settings),
+        GitHubProvider(settings),
+    ]
+    enabled = [p for p in providers if p.enabled]
+    disabled = [p.name for p in providers if not p.enabled]
+    if disabled:
+        log.info("providers disabled (missing key)", extra={"providers": disabled})
+    return enabled
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -58,13 +77,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         with storage:
             if args.show:
+                rows = storage.fetchall(
+                    "SELECT subject_id, key, value, label FROM watch_state ORDER BY subject_id, key"
+                )
+                by_subject = {}
+                for subject_id, key, value, label in rows:
+                    by_subject.setdefault(subject_id, []).append((key, value, label or ""))
                 for subject in storage.list_subjects():
-                    row = []
-                    for key in ("required_version", "latest_prerelease", "latest_news", "latest_release"):
-                        value = storage.get_watch_value(subject.id, key)
-                        if value:
-                            row.append("{}={}".format(key, (value["label"] or value["value"])[:40]))
-                    print("{:<38} {}".format(subject.name[:38], " | ".join(row) or "—"))
+                    entries = by_subject.get(subject.id, [])
+                    print("{}  (prio {})".format(subject.name, subject.priority))
+                    if not entries:
+                        print("    —")
+                    for key, value, label in entries:
+                        print("    {:<24} {:<14} {}".format(key, str(value)[:14], label[:52]))
                 print("\nсобытий в журнале: {}".format(storage.count_watch_events()))
                 return 0
 

@@ -84,6 +84,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # free, and raises the GitHub API limit from 60/h to 1000/h
           GITHUB_TOKEN: ${{ github.token }}
+          # optional; unlocks the CS2 matchmaking/scheduler signal
+          STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
+          DELTA_ALERT_FRACTION: ${{ vars.DELTA_ALERT_FRACTION }}
           OFFICE_TIMEZONE: ${{ vars.OFFICE_TIMEZONE || 'America/Los_Angeles' }}
           ANOMALY_MULTIPLIER: ${{ vars.ANOMALY_MULTIPLIER }}
           MIN_BASELINE_SAMPLES: ${{ vars.MIN_BASELINE_SAMPLES }}

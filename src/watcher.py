@@ -29,8 +29,27 @@ log = get_logger(__name__)
 
 #: keys whose change is an event in itself
 CHANGE_KEYS = frozenset(
-    {"required_version", "latest_news", "latest_prerelease", "latest_release"}
+    {
+        "required_version",
+        "latest_news",
+        "latest_prerelease",
+        "latest_release",
+        "sdr_revision",
+        "sdr_pops",
+        "gc_active_version",
+        "gc_deploy_in_flight",
+        "cs2_app_version",
+        "cs2_scheduler",
+        "cs2_services",
+    }
 )
+
+#: Keys that move constantly, where only a *sharp* move matters. Comparing them
+#: against a daily baseline would be wrong: player counts have a strong daily
+#: cycle, so every night would read as a collapse. A large relative jump
+#: against the previous reading has no such problem, and is exactly what a
+#: server restart looks like.
+DELTA_KEYS = frozenset({"players_current", "cs2_online_players", "cs2_online_servers"})
 
 
 class WatchStats:
@@ -42,13 +61,15 @@ class WatchStats:
         self.changes = 0
         self.changes_first_seen = 0
         self.rate_anomalies = 0
+        self.sharp_moves = 0
         self.alerts_sent = 0
         self.duration_seconds = 0.0
 
     def as_logline(self) -> str:
         return (
             "subjects_total={} subjects_read={} subjects_failed={} values={} "
-            "changes={} first_seen={} rate_anomalies={} alerts_sent={} duration={:.1f}s".format(
+            "changes={} first_seen={} rate_anomalies={} sharp_moves={} "
+            "alerts_sent={} duration={:.1f}s".format(
                 self.subjects_total,
                 self.subjects_read,
                 self.subjects_failed,
@@ -56,6 +77,7 @@ class WatchStats:
                 self.changes,
                 self.changes_first_seen,
                 self.rate_anomalies,
+                self.sharp_moves,
                 self.alerts_sent,
                 self.duration_seconds,
             )
@@ -158,6 +180,46 @@ class Watcher:
             first_ever=False,
         )
 
+    # -- sharp moves on constantly-changing counters ----------------------- #
+
+    def check_delta(self, subject: Subject, value: WatchValue) -> Optional[Dict[str, Any]]:
+        """Flag a large relative move against the *previous reading*.
+
+        Not against a daily baseline: player counts swing by a factor of two
+        over a day, so a baseline comparison would report every night as a
+        collapse. A 15% move between two readings half an hour apart is a
+        different thing entirely -- it is what a server restart looks like.
+        """
+        cfg = self.settings.anomaly
+        try:
+            current = float(value.value)
+        except (TypeError, ValueError):
+            return None
+
+        previous = self.storage.get_watch_value(subject.id, value.key)
+        self.storage.set_watch_value(value)
+        if previous is None:
+            return None
+        try:
+            before = float(previous["value"])
+        except (TypeError, ValueError):
+            return None
+        if before < cfg.delta_min_absolute:
+            return None
+
+        change = (current - before) / before
+        if abs(change) < cfg.delta_alert_fraction:
+            return None
+        return {
+            "subject": subject,
+            "key": value.key,
+            "current": current,
+            "previous": before,
+            "change": change,
+            "label": value.label,
+            "url": value.url,
+        }
+
     # -- rate anomalies ---------------------------------------------------- #
 
     def check_rate(self, subject: Subject, value: WatchValue, moment: datetime) -> Optional[Dict[str, Any]]:
@@ -207,6 +269,7 @@ class Watcher:
 
         events: List[WatchEvent] = []
         rate_hits: List[Dict[str, Any]] = []
+        delta_hits: List[Dict[str, Any]] = []
 
         for subject in subjects:
             values, error = self.read_subject(subject)
@@ -227,6 +290,11 @@ class Watcher:
                     else:
                         stats.changes += 1
                         events.append(event)
+                elif value.key in DELTA_KEYS:
+                    hit = self.check_delta(subject, value)
+                    if hit:
+                        delta_hits.append(hit)
+                        stats.sharp_moves += 1
                 else:
                     self.storage.set_watch_value(value)
                     hit = self.check_rate(subject, value, started)
@@ -234,8 +302,8 @@ class Watcher:
                         rate_hits.append(hit)
                         stats.rate_anomalies += 1
 
-        if self.notifier is not None and (events or rate_hits):
-            stats.alerts_sent = self.notifier.notify(events, rate_hits)
+        if self.notifier is not None and (events or rate_hits or delta_hits):
+            stats.alerts_sent = self.notifier.notify(events, rate_hits, delta_hits)
 
         stats.duration_seconds = round(time.monotonic() - started_wall, 2)
         self._report(stats, started, events, rate_hits)

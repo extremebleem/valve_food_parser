@@ -111,6 +111,11 @@ class AnomalyConfig:
     lookback_weeks: int = 4
     #: absolute floor so a jump from 1 to 3 commits is not "a burst"
     min_absolute_delta: float = 3.0
+    #: for constantly-moving counters: how big a relative move against the
+    #: previous reading counts as sharp. 0.15 = 15%.
+    delta_alert_fraction: float = 0.15
+    #: ignore relative moves on tiny numbers
+    delta_min_absolute: float = 500.0
 
 
 @dataclass(frozen=True)
@@ -167,6 +172,8 @@ def load_settings(env_file: Optional[str] = ".env") -> Settings:
         min_baseline_samples=env_int("MIN_BASELINE_SAMPLES", 7),
         lookback_weeks=env_int("BASELINE_LOOKBACK_WEEKS", 4),
         min_absolute_delta=env_float("RATE_MIN_ABSOLUTE_DELTA", 3.0),
+        delta_alert_fraction=env_float("DELTA_ALERT_FRACTION", 0.15),
+        delta_min_absolute=env_float("DELTA_MIN_ABSOLUTE", 500.0),
     )
 
     watch = WatchConfig(

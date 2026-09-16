@@ -48,11 +48,25 @@ no paid tier. The only credentials are your Telegram bot token and chat id.
 
 ## 1. What it watches
 
+### Counter-Strike 2 (the focus)
+
+| Signal | Endpoint | Key | Lead time |
+| --- | --- | --- | --- |
+| **Matchmaking scheduler / services** | `ICSGOServers_730/GetGameServersStatus` | free | minutes — Valve touches matchmaking before an update lands |
+| **App version** | same | free | minutes to hours |
+| **Relay network config** (`revision`, 48 datacenters) | `ISteamApps/GetSDRConfig` | none | hours to days — infrastructure work precedes what it is for |
+| **Server version** | `ISteamApps/UpToDateCheck` | none | minutes to hours, ahead of the blog post |
+| **Player-count collapse** | `GetNumberOfCurrentPlayers` | none | minutes — this is what a server restart looks like |
+| Official announcements | `ISteamNews/GetNewsForApp` | none | at announcement |
+
+### Everything else
+
 | Subject | Signal | Typical lead time |
 | --- | --- | --- |
 | **SteamOS / Steam Deck feed** (appid 1675200) | new preview / beta / client-beta post | **days to weeks** |
-| Counter-Strike 2, Dota 2, Deadlock, TF2 | `required_version` — the dedicated-server build | minutes to hours before the announcement |
-| CS2 / Dota 2 / Deadlock news feeds | newest official announcement | at announcement |
+| Dota 2, Deadlock, TF2 | `deploy_version` ≠ `active_version` — a rollout **in flight right now** | minutes |
+| Dota 2, Deadlock, TF2 | game coordinator + server version | minutes to hours |
+| Dota 2 / Deadlock news feeds | newest official announcement | at announcement |
 | `ValveSoftware/Proton`, `gamescope`, `SteamOS`, … | newest release | at release |
 | the same repositories | commits in the last 24 h | days — a burst precedes a release |
 
@@ -77,6 +91,14 @@ the very first run would fire one alert per watched key.
 
 A change is announced once. The `alerts` table keeps a fingerprint of
 `(subject, key, new value)`, so a re-read of the same value stays quiet.
+
+### Sharp moves — "did something just happen?"
+
+Player counts and server counts move constantly and have a strong daily cycle,
+so a baseline comparison would report every night as a collapse. These are
+instead compared against the **previous reading**: a move of more than
+`DELTA_ALERT_FRACTION` (default 15%) between two readings half an hour apart is
+flagged. That is precisely what a server restart looks like.
 
 ### Rate anomalies — "is Valve unusually busy?"
 
@@ -114,11 +136,12 @@ valve-watch/
 │   └── providers/
 │       ├── base.py             WatchProvider ABC + errors
 │       ├── steam.py            UpToDateCheck + GetNewsForApp
+│       ├── cs2.py              SDR config, game coordinator, CS2 server status
 │       └── github.py           releases + commit rate
 ├── scripts/
 │   ├── watch.py            one pass / --show / --dry-run
 │   └── init_db.py          create the schema
-├── tests/                  115 tests
+├── tests/                  158 tests
 ├── .github/workflows/      watch.yml · ci.yml
 ├── migrations/001_init.sql
 └── docs/RESEARCH-VALVE.md  what was tested and what was rejected
@@ -205,10 +228,11 @@ Private chats have a positive id; groups and channels have a negative one.
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | **yes** | from BotFather |
 | `TELEGRAM_CHAT_ID` | **yes** | target chat |
+| `STEAM_WEB_API_KEY` | no, but **recommended** | free and instant from [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey). Unlocks the CS2 matchmaking/scheduler signal — the earliest CS2 warning available. Without it that provider stays dormant and everything else still works. |
 | `DATABASE_URL` | no | leave unset to keep state in a workflow artifact |
 
-That is the whole list. Every data source is keyless, and the GitHub API token
-is provided by Actions automatically.
+Everything else is keyless, and the GitHub API token is provided by Actions
+automatically.
 
 ### Variables — *…→ Variables* (optional)
 
@@ -266,7 +290,7 @@ changes=0 first_seen=9 rate_anomalies=0 alerts_sent=0 duration=7.0s
 ## 10. Testing
 
 ```bash
-pytest                       # 115 tests
+pytest                       # 158 tests
 pytest --cov=src --cov-report=term-missing
 ruff check src scripts tests
 ```
@@ -294,16 +318,22 @@ minutes are free too; on a private one this uses roughly 48 runs/day × ~40 s
    busy right now.
 2. **No depot visibility.** The strongest early signal — a build pushed to a
    private branch — is not implemented; see [§4](#4-sources-and-their-limits).
-3. **Lead times are editorial.** The "typical lead" shown in a notification is a
+   `GetDepotPatchInfo` was tried and returns an empty object without manifest
+   ids, and the CS2 dedicated server is not addressable as its own app id.
+3. **CS2 has no game-coordinator signal.** `IGCVersion_730` answers with zeros,
+   so the "rollout in flight" signal exists for Dota 2, Deadlock and TF2 but not
+   for CS2. The matchmaking scheduler covers the same ground, and needs the free
+   Steam key.
+4. **Lead times are editorial.** The "typical lead" shown in a notification is a
    documented judgement about each signal type, not a measurement of that
    specific event.
-4. **Rate baselines need about a week** before commit bursts can be flagged.
+5. **Rate baselines need about a week** before commit bursts can be flagged.
    Change detection works from the second run.
-5. **Artifact state expires.** On the default backend history lives in an
+6. **Artifact state expires.** On the default backend history lives in an
    artifact with `retention-days: 30`; a repository idle for a month loses its
    watch state, and the next run silently re-records a baseline. Set
    `DATABASE_URL` if that matters.
-6. **A renamed or deleted subject** stops producing values silently. The run
+7. **A renamed or deleted subject** stops producing values silently. The run
    summary shows `subjects_failed`, which is where that surfaces.
 
 ### Possible improvements

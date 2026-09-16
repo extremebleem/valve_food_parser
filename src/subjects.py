@@ -30,11 +30,19 @@ class SubjectKind:
 #: notifications -- it is a documented editorial judgement, not a measurement.
 LEAD_TIME = {
     "latest_prerelease": "дни–недели",
+    "sdr_pops": "дни–недели",
+    "sdr_revision": "часы–дни",
+    "gc_deploy_in_flight": "минуты — выкатка идёт прямо сейчас",
+    "cs2_scheduler": "минуты — матчмейкинг трогают",
+    "cs2_services": "минуты",
     "latest_news": "часы–дни",
     "required_version": "минуты–часы",
-    "latest_tag": "дни",
+    "cs2_app_version": "минуты–часы",
+    "gc_active_version": "минуты–часы",
     "latest_release": "дни",
-    "default_branch_head": "дни",
+    "players_current": "минуты — серверы перезапускаются",
+    "cs2_online_players": "минуты",
+    "cs2_online_servers": "минуты",
 }
 
 
@@ -157,10 +165,22 @@ class WatchEvent:
 
 DEFAULT_SUBJECTS: List[Subject] = [
     # --- games: required_version bumps the moment a build goes live ---------
-    Subject.steam_app(730, "Counter-Strike 2", priority=10),
-    Subject.steam_app(570, "Dota 2", priority=10),
-    Subject.steam_app(440, "Team Fortress 2", priority=40),
-    Subject.steam_app(1422450, "Deadlock", priority=10),
+    #
+    # meta flags pick which extra providers run for a subject. CS2 gets the
+    # most because it exposes the most: the relay network config and, with a
+    # free Steam Web API key, the matchmaking scheduler. Its game coordinator
+    # is deliberately not watched -- IGCVersion_730 answers with zeros.
+    Subject.steam_app(
+        730,
+        "Counter-Strike 2",
+        priority=1,
+        meta={"watch_sdr": True, "watch_players": True, "watch_cs2_status": True},
+    ),
+    Subject.steam_app(570, "Dota 2", priority=10, meta={"watch_gc": True, "watch_players": True}),
+    Subject.steam_app(440, "Team Fortress 2", priority=40, meta={"watch_gc": True}),
+    Subject.steam_app(
+        1422450, "Deadlock", priority=10, meta={"watch_gc": True, "watch_players": True}
+    ),
     # --- feeds: beta and preview channels lead stable releases by days ------
     # 1675200 carries SteamOS Previews, SteamOS Betas *and* Steam Beta Client
     # Updates, all as official announcements. It is the single highest-value

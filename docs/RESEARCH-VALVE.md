@@ -36,6 +36,25 @@ ValveSoftware on GitHub: 55 public repos, 8 pushed in the last 14 days,
 60 commits over those 14 days (48 of them in gamescope alone).
 ```
 
+## Round 2 — CS2 specifically (2026-09-17)
+
+CS2 exposes more public state than any other Valve title.
+
+| Signal | Endpoint | Key | Result |
+| --- | --- | --- | --- |
+| **Relay network config** | `ISteamApps/GetSDRConfig?appid=730` | none | ✅ `revision` is a unix timestamp of the last change (read `1787769460` = 2026-08-26 18:37 UTC); `pops` lists **48** relay datacenters including Valve's own `sea` and `eat` |
+| **Matchmaking / scheduler / load** | `ICSGOServers_730/GetGameServersStatus` | **free key** | ✅ richest CS2 signal: app version, scheduler state, online/searching players, average search time, per-datacenter load. 403 without a key; keys are instant at steamcommunity.com/dev/apikey |
+| **Game coordinator rollout** | `IGCVersion_<appid>/GetServerVersion` | none | ✅ for Dota 2 (6933), Deadlock (6689), TF2. `deploy_version != active_version` means a rollout is in flight **right now**. ❌ for CS2 — `IGCVersion_730` answers `deploy_version: 0, active_version: 0` |
+| **Concurrent players** | `ISteamUserStats/GetNumberOfCurrentPlayers` | none | ✅ but only as a *sharp move vs the previous reading*; the daily cycle makes baseline comparison useless |
+| CS2 dedicated server as its own app | `UpToDateCheck?appid=740` | none | ❌ "Couldn't get app info" |
+| Steam Linux Runtime (sniper, soldier, scout) | `UpToDateCheck` on 1628350 / 1391110 / 1070560 | none | ❌ same — runtimes are not apps with a server version |
+| CS2 blog RSS | `blog.counter-strike.net/index.php/feed/` | none | ❌ **dead**: valid RSS, but the newest post is from 2023-04-25. Valve moved to the Steam news feed at the CS2 launch |
+| Depot patch info | `IContentServerDirectoryService/GetDepotPatchInfo` | none | ❌ returns `{"response":{}}` for depots 731/732/741 without manifest ids |
+| `IGCVersion_730/GetClientVersion` | — | — | ❌ 404, the method does not exist for 730 |
+
+`ISteamWebAPIUtil/GetSupportedAPIList` lists **27** interfaces reachable without
+a key; the ones above are everything in it relevant to this project.
+
 ## Consequence for the design
 
 Two different mechanisms, not one:
