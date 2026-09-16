@@ -190,6 +190,9 @@ jobs:
         with:
           name: monitor-state
           path: data/monitor.db.gz
-          retention-days: 7
+          # overwrite:true keeps exactly one copy at a time, so a longer
+          # retention costs no extra storage -- it only widens how long the
+          # repository can sit idle without losing every baseline.
+          retention-days: 30
           overwrite: true
           if-no-files-found: error

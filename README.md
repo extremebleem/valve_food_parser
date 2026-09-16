@@ -708,8 +708,10 @@ would need ~3 000 minutes and does **not** fit.
    for slots that were sampled, so widening the window later starts a fresh
    learning period for the newly covered hours.
 9. **Artifact state is less durable than a database.** On the default backend,
-   history lives in an artifact with `retention-days: 7`: a repository left idle
-   for a week loses every baseline. `overwrite: true` also deletes before it
+   history lives in an artifact with `retention-days: 30`: a repository left
+   idle for a month loses every baseline. The repository-level cap
+   (*Settings → Actions → Artifact and log retention*, 90 days by default)
+   truncates anything longer. `overwrite: true` also deletes before it
    uploads, so a run killed in that window loses the live copy — `discovery`
    therefore writes a dated backup once a day. Set `DATABASE_URL` if the history
    matters.
