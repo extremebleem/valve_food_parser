@@ -229,12 +229,16 @@ DEFAULT_SUBJECTS: List[Subject] = [
     Subject.steam_app(
         440, "Team Fortress 2", priority=40, min_interval_minutes=60, meta={"watch_gc": True}
     ),
+    # Deadlock is deliberately without watch_depot: its app_info carries only
+    # a "common" section under an anonymous login -- no depots, no branches, no
+    # manifests -- so a steamcmd call for it costs six seconds and returns
+    # nothing. Verified 2026-09-17. Its game coordinator still reports versions.
     Subject.steam_app(
         1422450,
         "Deadlock",
         priority=10,
         min_interval_minutes=20,
-        meta={"watch_gc": True, "watch_players": True, "watch_depot": True},
+        meta={"watch_gc": True, "watch_players": True},
     ),
     # --- feeds: beta and preview channels lead stable releases by days ------
     # 1675200 carries SteamOS Previews, SteamOS Betas *and* Steam Beta Client

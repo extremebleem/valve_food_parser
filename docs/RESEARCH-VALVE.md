@@ -143,6 +143,26 @@ The same round replaced digests with sorted lists for every set-valued key, so
 a notification can say *which* datacentre or domain appeared rather than only
 that the count moved.
 
+## Are there pre-release branches to watch? No (2026-09-17)
+
+The hope was that content lands on a private or beta branch before `public`,
+which would be a lead of hours or days. Checked anonymously across all three
+apps:
+
+| App | Branches | Verdict |
+| --- | --- | --- |
+| Counter-Strike 2 | 13 | all but `public` are **pinned historical versions** (`1.41.7.4`, `1.41.7.3`, …). The newest is 44 days older than `public`, so they are created *after* a release, not before |
+| Dota 2 | 1 | `public` only |
+| Deadlock | 0 | `app_info` carries only a `common` section under an anonymous login — no depots, no branches, no manifests at all |
+
+None of them is password-protected, and none is a staging channel. A new pinned
+branch appearing is still worth reporting, but it **lags** the release rather
+than leading it.
+
+So the earliest signal remains the `public` manifest itself. Deadlock's
+`watch_depot` flag was removed: six seconds of steamcmd per poll for a section
+that is not there.
+
 ## Consequence for the design
 
 Two different mechanisms, not one:

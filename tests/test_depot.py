@@ -367,3 +367,21 @@ def test_manifests_are_a_change_signal_ranked_with_the_build_id():
     assert "depot_manifests" in SET_KEYS
     assert "depot_manifests" in KEY_TITLES
     assert PRIORITY["depot_manifests"] <= PRIORITY["depot_public_buildid"]
+
+
+def test_deadlock_is_not_polled_through_steamcmd():
+    """Its app_info carries only a "common" section under an anonymous login --
+    no depots, no branches, no manifests -- so the call costs six seconds and
+    returns nothing. Verified against the live endpoint 2026-09-17."""
+    watched = {s.external_id for s in default_subjects() if s.meta.get("watch_depot")}
+    assert watched == {"730", "570"}
+
+
+def test_an_app_without_depot_access_yields_nothing(settings, monkeypatch):
+    """Anonymous app_info for a restricted app returns only "common"."""
+    provider = SteamDepotProvider(settings)
+    monkeypatch.setattr(provider, "steamcmd", "/fake/steamcmd.sh")
+    monkeypatch.setattr(
+        provider, "app_info", lambda appid: '"1422450"\n{\n\t"common"\n\t{\n\t\t"name"\t\t"Deadlock"\n\t}\n}\n'
+    )
+    assert provider.read(Subject.steam_app(1422450, "Deadlock", meta={"watch_depot": True})) == []
