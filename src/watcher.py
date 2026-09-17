@@ -355,6 +355,13 @@ class Watcher:
         if not subjects:
             raise RuntimeError("no subjects to watch")
 
+        due = [s for s in subjects if s.due(started)]
+        for provider in self.providers:
+            try:
+                provider.prefetch(due)
+            except Exception:  # an optional optimisation must never be fatal
+                log.exception("prefetch failed", extra={"provider": provider.name})
+
         events: List[WatchEvent] = []
         rate_hits: List[Dict[str, Any]] = []
         delta_hits: List[Dict[str, Any]] = []

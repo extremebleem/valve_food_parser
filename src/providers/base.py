@@ -49,5 +49,14 @@ class WatchProvider(abc.ABC):
         carry no official posts. Raise :class:`ProviderError` for real failures.
         """
 
+    def prefetch(self, subjects: List[Subject]) -> None:
+        """Optional: fetch for several subjects at once.
+
+        Worth overriding whenever the upstream costs more per *call* than per
+        *subject* -- one steamcmd session answering for two apps takes 6.7s
+        where two sessions take 10.5s.
+        """
+        return None
+
     def close(self) -> None:  # pragma: no cover - default no-op
         return None

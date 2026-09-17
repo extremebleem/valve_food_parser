@@ -385,3 +385,75 @@ def test_an_app_without_depot_access_yields_nothing(settings, monkeypatch):
         provider, "app_info", lambda appid: '"1422450"\n{\n\t"common"\n\t{\n\t\t"name"\t\t"Deadlock"\n\t}\n}\n'
     )
     assert provider.read(Subject.steam_app(1422450, "Deadlock", meta={"watch_depot": True})) == []
+
+
+# --------------------------------------------------------------------------- #
+# one steamcmd session for every watched app
+# --------------------------------------------------------------------------- #
+
+
+def test_prefetch_asks_for_every_app_in_one_session(settings, monkeypatch):
+    """Most of the cost is the session, not the query: one session answering
+    for two apps took 6.7s where two sessions took 10.5s."""
+    provider = SteamDepotProvider(settings)
+    monkeypatch.setattr(provider, "steamcmd", "/fake/steamcmd.sh")
+    calls = []
+
+    def fake_run(appids):
+        calls.append(list(appids))
+        return '"730"\n{\n\t"a" "1"\n}\n"570"\n{\n\t"b" "2"\n}\n'
+
+    monkeypatch.setattr(provider, "_run", fake_run)
+    subjects = [
+        Subject.steam_app(730, "CS2", meta={"watch_depot": True}),
+        Subject.steam_app(570, "Dota", meta={"watch_depot": True}),
+    ]
+    provider.prefetch(subjects)
+    assert calls == [["730", "570"]], "the apps must be asked for together"
+
+    # and reading afterwards must not start another session
+    calls.clear()
+    provider.app_info("730")
+    provider.app_info("570")
+    assert calls == []
+
+
+def test_prefetch_splits_the_dump_by_app():
+    provider_split = SteamDepotProvider.__dict__["_split_by_app"].__func__
+    text = '"730"\n{\n\t"cs" "yes"\n}\n"570"\n{\n\t"dota" "yes"\n}\n'
+    blocks = provider_split(text, ["730", "570"])
+    assert set(blocks) == {"730", "570"}
+    assert "cs" in blocks["730"] and "dota" not in blocks["730"]
+    assert "dota" in blocks["570"]
+
+
+def test_a_single_app_needs_no_prefetch(settings, monkeypatch):
+    provider = SteamDepotProvider(settings)
+    monkeypatch.setattr(provider, "steamcmd", "/fake/steamcmd.sh")
+    calls = []
+    monkeypatch.setattr(provider, "_run", lambda ids: calls.append(ids) or "")
+    provider.prefetch([Subject.steam_app(730, "CS2", meta={"watch_depot": True})])
+    assert calls == [], "one app is not worth a batch"
+
+
+def test_a_failed_prefetch_falls_back_to_per_app(settings, monkeypatch):
+    """An optimisation that breaks the run is worse than no optimisation."""
+    from src.providers.base import ProviderError
+
+    provider = SteamDepotProvider(settings)
+    monkeypatch.setattr(provider, "steamcmd", "/fake/steamcmd.sh")
+
+    def boom(appids):
+        if len(appids) > 1:
+            raise ProviderError("session died")
+        return APP_INFO
+
+    monkeypatch.setattr(provider, "_run", boom)
+    subjects = [
+        Subject.steam_app(730, "CS2", meta={"watch_depot": True}),
+        Subject.steam_app(570, "Dota", meta={"watch_depot": True}),
+    ]
+    provider.prefetch(subjects)
+    assert provider._cache == {}
+    # the per-app path still works
+    assert parse_branches(provider.app_info("730"))["public"]["buildid"] == "25218825"

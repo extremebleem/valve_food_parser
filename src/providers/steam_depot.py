@@ -158,6 +158,8 @@ class SteamDepotProvider(WatchProvider):
         super().__init__(settings)
         self.steamcmd = find_steamcmd()
         self.timeout = int(os.environ.get("STEAMCMD_TIMEOUT_SECONDS", "180"))
+        #: appid -> raw app_info block, filled by prefetch and used for one run
+        self._cache: Dict[str, str] = {}
 
     @property
     def enabled(self) -> bool:
@@ -174,16 +176,54 @@ class SteamDepotProvider(WatchProvider):
             and bool(subject.meta.get("watch_depot"))
         )
 
+    def prefetch(self, subjects: List[Subject]) -> None:
+        """Ask for every watched app in one steamcmd session.
+
+        Most of the cost is the session itself -- connecting and logging in --
+        not the query, so asking for two apps at once is measurably cheaper
+        than two sessions.
+        """
+        appids = [s.external_id for s in subjects if self.supports(s)]
+        if len(appids) < 2:
+            return
+        try:
+            combined = self._run(appids)
+        except ProviderError as exc:
+            log.info("steamcmd prefetch failed, falling back to per-app", extra={"error": str(exc)[:160]})
+            return
+        self._cache = self._split_by_app(combined, appids)
+
+    @staticmethod
+    def _split_by_app(text: str, appids: List[str]) -> Dict[str, str]:
+        """Cut a multi-app dump into one block per app.
+
+        app_info_print emits each app as a top-level `"<appid>"` object, so the
+        start of the next one marks the end of the previous.
+        """
+        marks = []
+        for appid in appids:
+            index = text.find('"{}"\n'.format(appid))
+            if index >= 0:
+                marks.append((index, appid))
+        marks.sort()
+        blocks: Dict[str, str] = {}
+        for position, (start, appid) in enumerate(marks):
+            end = marks[position + 1][0] if position + 1 < len(marks) else len(text)
+            blocks[appid] = text[start:end]
+        return blocks
+
     def app_info(self, appid: str) -> str:
+        cached = self._cache.get(str(appid))
+        if cached:
+            return cached
+        return self._run([str(appid)])
+
+    def _run(self, appids: List[str]) -> str:
         assert self.steamcmd
-        command = [
-            self.steamcmd,
-            "+login",
-            "anonymous",
-            "+app_info_print",
-            str(appid),
-            "+quit",
-        ]
+        command = [self.steamcmd, "+login", "anonymous"]
+        for appid in appids:
+            command += ["+app_info_print", str(appid)]
+        command.append("+quit")
         try:
             result = subprocess.run(
                 command,
