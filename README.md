@@ -94,6 +94,29 @@ the very first run would fire one alert per watched key.
 A change is announced once. The `alerts` table keeps a fingerprint of
 `(subject, key, new value)`, so a re-read of the same value stays quiet.
 
+### How Steam decides what to download, and why that is the signal
+
+`app_info` gives Steam a **manifest id per depot per branch**; the manifest
+lists the files and chunks; the chunks come from the CDN. So the manifest id is
+the thing that moves the instant Valve publishes content — before any
+announcement, and before anyone downloads the files to dump them.
+
+That makes it strictly better than the build id. The build id says *something*
+changed; the manifest says **which depot** did, and its download size says how
+much. For CS2 that separates the 54 GB content depot from the 5 GB Windows
+binaries and the 4.6 GB Linux ones:
+
+```
+📦 Обновилось содержимое депотов
+Counter-Strike 2
+депот 2347773 (linux), закачка 4.7 ГБ
+депот 2347780 (linux) — новый, закачка 0.1 ГБ
+```
+
+Only the depots that actually moved are named. Depots downloading under a
+megabyte are launcher stubs — CS2 has eight — and are skipped, or every
+notification would carry eight lines that say nothing.
+
 ### Quiet routine, audible changes
 
 Leave the chat **unmuted**. A real change is sent normally and rings. A routine
