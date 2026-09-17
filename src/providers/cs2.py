@@ -29,7 +29,6 @@ rather than silently omitted.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from typing import Any, List
 
@@ -109,12 +108,13 @@ class SteamSDRProvider(WatchProvider):
         pops = payload.get("pops")
         if isinstance(pops, dict) and pops:
             names = sorted(pops)
-            digest = hashlib.sha1(",".join(names).encode("utf-8")).hexdigest()[:16]
             values.append(
                 WatchValue(
                     subject_id=subject.id,
                     key="sdr_pops",
-                    value=digest,
+                    # the sorted list rather than a digest, so the notification
+                    # can name the datacentre that appeared or went away
+                    value="|".join(names),
                     label="{} релейных дата-центров".format(len(names)),
                     detail=", ".join(names[:16]) + ("…" if len(names) > 16 else ""),
                     url=subject.url,

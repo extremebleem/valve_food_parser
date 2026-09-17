@@ -8,7 +8,15 @@ import pytest
 from src.providers.steam_infra import SteamInfraProvider
 from src.subjects import Subject, SubjectKind, WatchEvent, default_subjects
 from src.watch_telegram import WatchNotifier
-from src.watcher import CHANGE_KEYS, DELTA_KEYS, DELTA_RULES, HEALTH_KEYS
+from src.watcher import (
+    CHANGE_KEYS,
+    DELTA_KEYS,
+    DELTA_RULES,
+    LOAD_DELTA_RULE,
+    SET_KEYS,
+    is_delta_key,
+    is_health_key,
+)
 
 
 def infra():
@@ -46,40 +54,6 @@ def stub(provider, **by_url):
     provider.client.get_json = fake
 
 
-def test_load_uses_valves_own_caches_not_the_partner_cdns(settings):
-    """Partner CDNs report load 0; including them would halve the number and
-    hide a real spike. Verified against the live endpoint 2026-09-17."""
-    provider = SteamInfraProvider(settings)
-    stub(provider, GetServersForSteamPipe=SERVERS)
-    values = {v.key: v for v in provider.read(infra())}
-    assert values["steampipe_load_max"].value == "80"
-    assert "пик 80%" in values["steampipe_load_max"].label
-    assert "средняя 78%" in values["steampipe_load_max"].label
-
-
-def test_host_digest_tracks_membership_not_order(settings):
-    provider = SteamInfraProvider(settings)
-    stub(provider, GetServersForSteamPipe=SERVERS)
-    first = {v.key: v.value for v in provider.read(infra())}["steampipe_hosts"]
-
-    reordered = {"response": {"servers": list(reversed(SERVERS["response"]["servers"]))}}
-    stub(provider, GetServersForSteamPipe=reordered)
-    assert {v.key: v.value for v in provider.read(infra())}["steampipe_hosts"] == first
-
-    dropped = {"response": {"servers": SERVERS["response"]["servers"][:3]}}
-    stub(provider, GetServersForSteamPipe=dropped)
-    assert {v.key: v.value for v in provider.read(infra())}["steampipe_hosts"] != first
-
-
-def test_no_load_value_when_every_server_reports_zero(settings):
-    provider = SteamInfraProvider(settings)
-    stub(
-        provider,
-        GetServersForSteamPipe={"response": {"servers": [{"host": "a.b.c", "load": 0}]}},
-    )
-    keys = {v.key for v in provider.read(infra())}
-    assert "steampipe_hosts" in keys
-    assert "steampipe_load_max" not in keys
 
 
 def test_domains_and_client_update_hosts(settings):
@@ -102,22 +76,6 @@ def test_malformed_server_payloads_are_survivable(settings, bad):
     assert provider.read(infra()) == []
 
 
-def test_a_broken_secondary_endpoint_does_not_lose_the_primary(settings):
-    """GetSteamPipeDomains failing must not cost us the server list."""
-    from src.http import HttpError
-
-    provider = SteamInfraProvider(settings)
-
-    def fake(url, *a, **k):
-        if "GetServersForSteamPipe" in url:
-            return SERVERS
-        raise HttpError("boom", 500)
-
-    provider.client.get_json = fake
-    keys = {v.key for v in provider.read(infra())}
-    assert "steampipe_hosts" in keys
-    assert "steampipe_domains" not in keys
-
 
 def test_infra_subject_is_in_the_watch_list():
     infra_subjects = [s for s in default_subjects() if s.kind == SubjectKind.STEAM_INFRA]
@@ -136,11 +94,21 @@ def test_provider_only_claims_infra_subjects(settings):
 
 
 def test_every_infra_key_is_classified():
-    for key in ("steampipe_hosts", "steampipe_domains", "client_update_hosts"):
+    for key in ("steampipe_domains", "client_update_hosts"):
         assert key in CHANGE_KEYS
-    for key in ("steampipe_load_max", "cs2_search_seconds_avg"):
-        assert key in DELTA_KEYS
+        assert key in SET_KEYS
+    assert is_delta_key("cs2_search_seconds_avg")
+    assert is_delta_key("steampipe_load_fra1")
     assert not (CHANGE_KEYS & DELTA_KEYS)
+
+
+def test_the_unstable_host_set_is_not_watched():
+    """GetServersForSteamPipe ignores cell_id, answers by caller location and
+    returns a different set on two back-to-back calls. It produced a false
+    alert on its first day, so it is not a signal."""
+    assert "steampipe_hosts" not in CHANGE_KEYS
+    assert "steampipe_hosts" not in SET_KEYS
+    assert not is_delta_key("steampipe_hosts")
 
 
 def test_thresholds_are_scaled_per_metric():
@@ -149,7 +117,9 @@ def test_thresholds_are_scaled_per_metric():
     assert DELTA_RULES["cs2_search_seconds_avg"][1] < DELTA_RULES["players_current"][1]
     assert DELTA_RULES["cs2_search_seconds_avg"][0] > DELTA_RULES["players_current"][0]
     for key in DELTA_RULES:
-        assert key in DELTA_KEYS
+        assert is_delta_key(key)
+    # regional load keys share one rule rather than needing an entry each
+    assert LOAD_DELTA_RULE[0] > 0 and LOAD_DELTA_RULE[1] > 0
 
 
 def test_search_time_uses_its_own_floor(settings, storage):
@@ -170,16 +140,17 @@ def test_search_time_uses_its_own_floor(settings, storage):
 
 
 def test_health_keys_are_the_strain_signals():
-    for key in ("cs2_scheduler", "cs2_search_seconds_avg", "steampipe_load_max"):
-        assert key in HEALTH_KEYS
+    for key in ("cs2_scheduler", "cs2_search_seconds_avg"):
+        assert is_health_key(key)
+    assert is_health_key("steampipe_load_iad")
     # a new preview post is news, not strain
-    assert "latest_prerelease" not in HEALTH_KEYS
+    assert not is_health_key("latest_prerelease")
 
 
 def test_strain_line_appears_only_when_several_signals_move(settings, storage):
     notifier = WatchNotifier(settings, storage, client=RecordingClient())
     cs = Subject.steam_app(730, "Counter-Strike 2")
-    one = [{"subject": cs, "key": "steampipe_load_max", "current": 98, "previous": 79, "change": 0.24}]
+    one = [{"subject": cs, "key": "steampipe_load_fra1", "current": 98, "previous": 79, "change": 0.24}]
     two = one + [
         {"subject": cs, "key": "cs2_search_seconds_avg", "current": 96, "previous": 38, "change": 1.5}
     ]
@@ -191,7 +162,7 @@ def test_strain_counts_change_events_too(settings, storage):
     notifier = WatchNotifier(settings, storage, client=RecordingClient())
     cs = Subject.steam_app(730, "Counter-Strike 2")
     events = [WatchEvent(cs, "cs2_scheduler", "normal", "delayed")]
-    deltas = [{"subject": cs, "key": "steampipe_load_max", "current": 98, "previous": 79, "change": 0.24}]
+    deltas = [{"subject": cs, "key": "steampipe_load_fra1", "current": 98, "previous": 79, "change": 0.24}]
     assert notifier.health_signal_count(events, deltas) == 2
     assert "инфраструктурного напряжения" in notifier.build(events, [], deltas)
 
@@ -200,7 +171,123 @@ def test_strain_does_not_double_count_the_same_key(settings, storage):
     notifier = WatchNotifier(settings, storage, client=RecordingClient())
     cs = Subject.steam_app(730, "Counter-Strike 2")
     deltas = [
-        {"subject": cs, "key": "steampipe_load_max", "current": 98, "previous": 79, "change": 0.24},
-        {"subject": cs, "key": "steampipe_load_max", "current": 99, "previous": 80, "change": 0.24},
+        {"subject": cs, "key": "steampipe_load_fra1", "current": 98, "previous": 79, "change": 0.24},
+        {"subject": cs, "key": "steampipe_load_fra1", "current": 99, "previous": 80, "change": 0.24},
     ]
     assert notifier.health_signal_count([], deltas) == 1
+
+
+# --------------------------------------------------------------------------- #
+# load, keyed per datacentre
+# --------------------------------------------------------------------------- #
+
+
+SERVERS_FRA = {
+    "response": {
+        "servers": [
+            {"type": "CDN", "host": "fastly.cdn.steampipe.steamcontent.com", "load": 0},
+            {"type": "SteamCache", "host": "cache1-fra1.steamcontent.com", "load": 30},
+            {"type": "SteamCache", "host": "cache2-fra1.steamcontent.com", "load": 32},
+        ]
+    }
+}
+SERVERS_IAD = {
+    "response": {
+        "servers": [
+            {"type": "SteamCache", "host": "cache1-iad.steamcontent.com", "load": 77},
+            {"type": "SteamCache", "host": "cache2-iad.steamcontent.com", "load": 80},
+        ]
+    }
+}
+
+
+def test_load_is_keyed_by_datacentre(settings):
+    """A run on a European runner and one on a US runner read different caches;
+    a shared key would make that look like a collapse."""
+    provider = SteamInfraProvider(settings)
+    stub(provider, GetServersForSteamPipe=SERVERS_FRA)
+    fra = {v.key: v for v in provider.read(infra())}
+    stub(provider, GetServersForSteamPipe=SERVERS_IAD)
+    iad = {v.key: v for v in provider.read(infra())}
+
+    assert "steampipe_load_fra1" in fra
+    assert "steampipe_load_iad" in iad
+    assert set(fra) & set(iad) == set(), "the two regions must not share a key"
+    assert fra["steampipe_load_fra1"].value == "32"
+    assert iad["steampipe_load_iad"].value == "80"
+
+
+def test_partner_cdns_are_excluded_from_the_load(settings):
+    """They report 0, and including them would halve the figure."""
+    provider = SteamInfraProvider(settings)
+    stub(provider, GetServersForSteamPipe=SERVERS_FRA)
+    load = {v.key: v for v in provider.read(infra())}["steampipe_load_fra1"]
+    assert "пик 32%" in load.label
+    assert "средняя 31%" in load.label
+
+
+def test_no_load_value_when_every_node_reports_zero(settings):
+    provider = SteamInfraProvider(settings)
+    stub(provider, GetServersForSteamPipe={"response": {"servers": [{"host": "a-fra1.x", "load": 0}]}})
+    assert [v for v in provider.read(infra()) if v.key.startswith("steampipe_load_")] == []
+
+
+def test_region_falls_back_when_host_names_carry_none(settings):
+    provider = SteamInfraProvider(settings)
+    stub(provider, GetServersForSteamPipe={"response": {"servers": [{"host": "weird", "load": 40}]}})
+    keys = {v.key for v in provider.read(infra())}
+    assert "steampipe_load_unknown" in keys
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"response": None}, {"response": {"servers": "x"}}])
+def test_malformed_server_payloads_are_survivable(settings, bad):
+    provider = SteamInfraProvider(settings)
+    stub(provider, GetServersForSteamPipe=bad)
+    assert [v for v in provider.read(infra()) if v.key.startswith("steampipe_load_")] == []
+
+
+# --------------------------------------------------------------------------- #
+# sets are stored readable, so a change can be described
+# --------------------------------------------------------------------------- #
+
+
+def test_domains_are_stored_as_a_sorted_list(settings):
+    provider = SteamInfraProvider(settings)
+    stub(
+        provider,
+        GetServersForSteamPipe=SERVERS_FRA,
+        GetSteamPipeDomains={"response": {"domainlist": ["b.example", "a.example"]}},
+    )
+    domains = {v.key: v for v in provider.read(infra())}["steampipe_domains"]
+    assert domains.value == "a.example|b.example"
+
+
+def test_a_set_change_names_what_moved(settings, storage):
+    from src.watch_telegram import describe_set_change
+
+    assert describe_set_change("a|b", "a|b|c") == ["+ c"]
+    assert describe_set_change("a|b", "a") == ["− b"]
+    assert describe_set_change("a|b", "a|c") == ["+ c", "− b"]
+    assert describe_set_change("a", "a") == []
+    assert describe_set_change("", "a") == ["+ a"]
+
+
+def test_the_digest_to_list_upgrade_is_not_reported_as_a_change(settings, storage):
+    """These keys used to hold a digest. Re-recording the readable form is not
+    news, and reporting it would have fired one alert per key on upgrade."""
+    from src.models import utcnow
+    from src.subjects import WatchValue
+    from src.watcher import Watcher
+
+    subject = infra()
+    storage.upsert_subjects([subject])
+    storage.set_watch_value(
+        WatchValue(subject.id, "steampipe_domains", "7792f31c9bc9705c", observed_at=utcnow())
+    )
+    watcher = Watcher(settings, storage, [], notifier=None)
+    event = watcher.detect_change(
+        subject, WatchValue(subject.id, "steampipe_domains", "a.example|b.example", observed_at=utcnow())
+    )
+    assert event is None
+    # and the readable value is now what is stored
+    assert storage.get_watch_value(subject.id, "steampipe_domains")["value"] == "a.example|b.example"

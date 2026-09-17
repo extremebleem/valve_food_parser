@@ -6,11 +6,17 @@ up; matchmaking strains, so search times climb. None of that is an
 announcement, but all of it is public and keyless.
 
 ``IContentServerDirectoryService/GetServersForSteamPipe``
-    The content-delivery servers for a cell. Two different signals live here:
-    the *set of hosts* (Valve adding or dropping a CDN partner is
-    infrastructure news, and rare), and the *load* on Valve's own SteamCache
-    nodes. Verified 2026-09-17: partner CDNs report ``load: 0`` while
-    ``cache1-sto2`` … ``cache6-sto2`` reported 77-80, so the number is real.
+    The content-delivery servers *near the caller*. Measured 2026-09-17: the
+    ``cell_id`` parameter is ignored, the answer depends on the caller's
+    address (``fra1``/``sto2`` from Europe, ``atl``/``iad`` from a US runner),
+    and two identical back-to-back calls return different sets. The host set is
+    therefore **not watched** -- it produced a false alert on its first day.
+
+    The load figure is real and steady (31-32 across five calls ten seconds
+    apart) but it describes whichever regional caches answered. It is stored
+    per region, so a delta only ever compares readings from the same place;
+    otherwise a run on a European runner followed by one on a US runner would
+    read as a collapse.
 
 ``ISteamDirectory/GetSteamPipeDomains``
     The domains content is served from. Changes rarely; a new one appearing is
@@ -23,7 +29,6 @@ announcement, but all of it is public and keyless.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from typing import Any, List
 
@@ -44,8 +49,9 @@ CLIENT_UPDATE_HOSTS_URL = (
 )
 
 
-def _digest(parts: List[str]) -> str:
-    return hashlib.sha1(",".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
+#: per-region prefix, so a load reading is only ever compared with one from the
+#: same datacentre
+LOAD_KEY_PREFIX = "steampipe_load_"
 
 
 class SteamInfraProvider(WatchProvider):
@@ -86,21 +92,6 @@ class SteamInfraProvider(WatchProvider):
             return []
 
         hosts = [str(s.get("host") or "") for s in servers if isinstance(s, dict) and s.get("host")]
-        # the provider is the stable part of a host name; individual cache nodes
-        # come and go, partners do not
-        providers = sorted({h.split(".")[0].rstrip("0123456789-") for h in hosts})
-
-        out = [
-            WatchValue(
-                subject_id=subject.id,
-                key="steampipe_hosts",
-                value=_digest(hosts),
-                label="{} узлов раздачи: {}".format(len(hosts), ", ".join(providers[:8])),
-                detail="cell_id={}".format(self.cell_id),
-                url="https://store.steampowered.com/",
-                observed_at=now,
-            )
-        ]
 
         # Valve's own caches report a real utilisation percentage; partner CDNs
         # report 0, so they are excluded rather than dragging the number down
@@ -109,22 +100,41 @@ class SteamInfraProvider(WatchProvider):
             for s in servers
             if isinstance(s, dict) and isinstance(s.get("load"), (int, float)) and s["load"] > 0
         ]
-        if loads:
-            peak = max(loads)
-            out.append(
-                WatchValue(
-                    subject_id=subject.id,
-                    key="steampipe_load_max",
-                    value="{:.0f}".format(peak),
-                    label="загрузка кешей Valve: пик {:.0f}%, средняя {:.0f}%".format(
-                        peak, sum(loads) / len(loads)
-                    ),
-                    detail="по {} узлам".format(len(loads)),
-                    url="https://store.steampowered.com/",
-                    observed_at=now,
-                )
+        if not loads:
+            return []
+
+        region = self._region_of(hosts)
+        peak = max(loads)
+        return [
+            WatchValue(
+                subject_id=subject.id,
+                key="{}{}".format(LOAD_KEY_PREFIX, region),
+                value="{:.0f}".format(peak),
+                label="загрузка кешей Valve ({}): пик {:.0f}%, средняя {:.0f}%".format(
+                    region, peak, sum(loads) / len(loads)
+                ),
+                detail="по {} узлам".format(len(loads)),
+                url="https://store.steampowered.com/",
+                observed_at=now,
             )
-        return out
+        ]
+
+    @staticmethod
+    def _region_of(hosts: List[str]) -> str:
+        """The datacentre most of these nodes live in.
+
+        Host names look like ``cache3-fra1.steamcontent.com``; the suffix after
+        the dash is the site. Readings are keyed by it so a delta never compares
+        two different parts of the world.
+        """
+        from collections import Counter
+
+        sites = Counter()
+        for host in hosts:
+            name = host.split(".")[0]
+            if "-" in name:
+                sites[name.rsplit("-", 1)[1]] += 1
+        return sites.most_common(1)[0][0] if sites else "unknown"
 
     # -- delivery domains --------------------------------------------------- #
 
@@ -138,14 +148,16 @@ class SteamInfraProvider(WatchProvider):
         domains = response.get("domainlist") if isinstance(response, dict) else None
         if not isinstance(domains, list) or not domains:
             return []
-        names = [str(d) for d in domains]
+        names = sorted(str(d) for d in domains)
         return [
             WatchValue(
                 subject_id=subject.id,
                 key="steampipe_domains",
-                value=_digest(names),
+                # the sorted list, not a digest: a digest can say that something
+                # changed but never what, which is the first thing anyone asks
+                value="|".join(names),
                 label="{} доменов раздачи".format(len(names)),
-                detail=", ".join(sorted(names)[:6]),
+                detail=", ".join(names[:6]),
                 url="https://store.steampowered.com/",
                 observed_at=now,
             )
@@ -168,7 +180,7 @@ class SteamInfraProvider(WatchProvider):
             WatchValue(
                 subject_id=subject.id,
                 key="client_update_hosts",
-                value=_digest([blob]),
+                value="|".join(hosts),
                 label="{} хостов обновления клиента".format(len(hosts)),
                 detail=", ".join(hosts[:6]),
                 url="https://store.steampowered.com/",

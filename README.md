@@ -55,6 +55,7 @@ no paid tier. The only credentials are your Telegram bot token and chat id.
 | **Matchmaking scheduler / services** | `ICSGOServers_730/GetGameServersStatus` | free | minutes — Valve touches matchmaking before an update lands |
 | **App version** | same | free | minutes to hours |
 | **Relay network config** (`revision`, 48 datacenters) | `ISteamApps/GetSDRConfig` | none | hours to days — infrastructure work precedes what it is for |
+| **Cache load**, per datacentre | `GetServersForSteamPipe` | none | minutes — everyone downloading at once is what a rollout looks like |
 | **Server version** | `ISteamApps/UpToDateCheck` | none | minutes to hours, ahead of the blog post |
 | **Player-count collapse** | `GetNumberOfCurrentPlayers` | none | minutes — this is what a server restart looks like |
 | Official announcements | `ISteamNews/GetNewsForApp` | none | at announcement |

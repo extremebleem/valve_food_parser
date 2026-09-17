@@ -32,10 +32,9 @@ class SubjectKind:
 LEAD_TIME = {
     "depot_branches": "часы–дни — ветка появляется раньше публичной выкладки",
     "depot_public_buildid": "минуты — билд выложен, до анонса",
-    "steampipe_hosts": "дни",
     "steampipe_domains": "дни",
     "client_update_hosts": "часы–дни",
-    "steampipe_load_max": "минуты — идёт массовая загрузка",
+    "steampipe_load": "минуты — идёт массовая загрузка",
     "cs2_search_seconds_avg": "минуты — матчмейкингу тяжело",
     "latest_prerelease": "дни–недели",
     "sdr_pops": "дни–недели",
@@ -186,7 +185,11 @@ class WatchEvent:
 
     @property
     def lead_time(self) -> str:
-        return LEAD_TIME.get(self.key, "")
+        if self.key in LEAD_TIME:
+            return LEAD_TIME[self.key]
+        # load readings are keyed per datacentre: steampipe_load_fra1, _iad, ...
+        prefix = self.key.rsplit("_", 1)[0]
+        return LEAD_TIME.get(prefix, "")
 
 
 # --------------------------------------------------------------------------- #

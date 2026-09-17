@@ -38,7 +38,6 @@ KEY_TITLES = {
     "gc_active_version": "🧩 Версия game coordinator изменилась",
     "latest_release": "🏷 Новый релиз",
     "latest_news": "📰 Официальный пост",
-    "steampipe_hosts": "📦 Изменился состав узлов раздачи",
     "steampipe_domains": "📦 Изменились домены раздачи",
     "client_update_hosts": "⬇️ Изменились хосты обновления клиента",
 }
@@ -61,11 +60,19 @@ PRIORITY = {
     "required_version": 7,
     "gc_active_version": 8,
     "client_update_hosts": 9,
-    "steampipe_hosts": 10,
     "steampipe_domains": 11,
     "latest_release": 12,
     "latest_news": 13,
 }
+
+
+def describe_set_change(old: str, new: str) -> List[str]:
+    """What appeared and what went away between two ``a|b|c`` sets."""
+    before = {p for p in str(old).split("|") if p}
+    after = {p for p in str(new).split("|") if p}
+    return ["+ {}".format(x) for x in sorted(after - before)] + [
+        "− {}".format(x) for x in sorted(before - after)
+    ]
 
 
 def event_hash(event: WatchEvent) -> str:
@@ -125,10 +132,10 @@ class WatchNotifier:
         rollout. The message reports the count and stops there; it does not
         claim to know what is being rolled out.
         """
-        from .watcher import HEALTH_KEYS
+        from .watcher import is_health_key
 
-        keys = {e.key for e in events if e.key in HEALTH_KEYS}
-        keys |= {h.get("key") for h in delta_hits if h.get("key") in HEALTH_KEYS}
+        keys = {e.key for e in events if is_health_key(e.key)}
+        keys |= {h.get("key") for h in delta_hits if is_health_key(str(h.get("key") or ""))}
         return len(keys)
 
     @staticmethod
@@ -176,10 +183,12 @@ class WatchNotifier:
             "depot_public_buildid",
         ):
             lines.append("<code>{} → {}</code>".format(self.esc(event.old_value), self.esc(event.new_value)))
-        if event.key == "depot_branches":
-            from .providers.steam_depot import describe_branch_change
+        from .watcher import SET_KEYS
 
-            for line in describe_branch_change(event.old_value, event.new_value)[:8]:
+        if event.key in SET_KEYS:
+            # a set changed: name what appeared and what went away, because
+            # "the count went from 15 to 16" is not an answer to "what changed"
+            for line in describe_set_change(event.old_value, event.new_value)[:10]:
                 lines.append("<code>{}</code>".format(self.esc(line)))
         elif event.key == "cs2_services":
             changed = self.service_changes(event.old_value, event.new_value)

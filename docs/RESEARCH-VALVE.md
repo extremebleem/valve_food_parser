@@ -119,6 +119,30 @@ guessed earlier). It answers nothing on `UpToDateCheck`, `IGCVersion`,
 `GetSDRConfig` or `GetNewsForApp` — a depot-only app, reachable through PICS
 alone.
 
+## Correction — the content-delivery host set is not a signal (2026-09-17)
+
+Shipped as a change signal, then withdrawn after it produced a false alert on
+its first day. Three measurements settled it:
+
+* `GetServersForSteamPipe` **ignores `cell_id`** and answers by the caller's
+  address — `fra1`/`sto2` from Europe, `atl`/`iad` from a US GitHub runner.
+* Two identical back-to-back calls from one address return **different sets**
+  (`alibaba` in one, `steampipe` in the next).
+* Everything else from the same family is stable across repeated calls:
+  `GetSteamPipeDomains`, `GetClientUpdateHosts` and `GetSDRConfig` all return the
+  same digest three times running.
+
+So the host set is gone. The **load** figure survives, because it is steady
+(31-32 across five calls ten seconds apart) — but it describes whichever
+regional caches answered, so it is stored per datacentre
+(`steampipe_load_fra1`, `steampipe_load_iad`, …) and a delta only ever compares
+two readings from the same place. A run on a European runner followed by one on
+a US runner would otherwise read as a collapse.
+
+The same round replaced digests with sorted lists for every set-valued key, so
+a notification can say *which* datacentre or domain appeared rather than only
+that the count moved.
+
 ## Consequence for the design
 
 Two different mechanisms, not one:

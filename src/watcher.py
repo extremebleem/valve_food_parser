@@ -13,6 +13,7 @@ that is where the median/MAD machinery earns its keep.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -26,6 +27,9 @@ from .storage import BaseStorage
 from .subjects import Subject, WatchEvent, WatchValue, default_subjects
 
 log = get_logger(__name__)
+
+#: how the set-valued keys were stored before they held a readable list
+_LEGACY_DIGEST = re.compile(r"^[0-9a-f]{16}$")
 
 #: keys whose change is an event in itself
 CHANGE_KEYS = frozenset(
@@ -43,7 +47,6 @@ CHANGE_KEYS = frozenset(
         "cs2_services",
         "depot_public_buildid",
         "depot_branches",
-        "steampipe_hosts",
         "steampipe_domains",
         "client_update_hosts",
     }
@@ -60,9 +63,23 @@ DELTA_KEYS = frozenset(
         "cs2_online_players",
         "cs2_online_servers",
         "cs2_search_seconds_avg",
-        "steampipe_load_max",
     }
 )
+
+#: Load readings are keyed per datacentre (steampipe_load_fra1, _iad, ...): the
+#: content-delivery answer depends on where the caller is, and a GitHub runner
+#: is not always in the same region. Comparing Frankfurt against Virginia would
+#: read as a collapse, so only same-region readings are ever compared.
+DELTA_KEY_PREFIXES = ("steampipe_load_",)
+
+
+def is_delta_key(key: str) -> bool:
+    return key in DELTA_KEYS or key.startswith(DELTA_KEY_PREFIXES)
+
+
+#: values stored as a sorted "a|b|c" set rather than a scalar; a change in one
+#: is rendered as what appeared and what went away
+SET_KEYS = frozenset({"depot_branches", "sdr_pops", "steampipe_domains", "client_update_hosts"})
 
 #: Per-key (minimum relative move, minimum absolute value) for DELTA_KEYS. One
 #: global threshold cannot serve both a million-player counter and a
@@ -74,8 +91,10 @@ DELTA_RULES = {
     "cs2_online_players": (0.15, 5_000.0),
     "cs2_online_servers": (0.15, 100.0),
     "cs2_search_seconds_avg": (0.40, 10.0),
-    "steampipe_load_max": (0.20, 20.0),
 }
+
+#: default for any steampipe_load_<region> key
+LOAD_DELTA_RULE = (0.20, 20.0)
 
 #: Signals that describe Valve's plumbing being under strain. Individually each
 #: has an innocent explanation; several moving in one run is the shape of a
@@ -87,9 +106,14 @@ HEALTH_KEYS = frozenset(
         "cs2_search_seconds_avg",
         "cs2_online_servers",
         "cs2_online_players",
-        "steampipe_load_max",
     }
 )
+#: a load reading is a strain signal whatever region it came from
+HEALTH_KEY_PREFIXES = ("steampipe_load_",)
+
+
+def is_health_key(key: str) -> bool:
+    return key in HEALTH_KEYS or key.startswith(HEALTH_KEY_PREFIXES)
 
 
 class WatchStats:
@@ -212,6 +236,16 @@ class Watcher:
         if str(previous["value"]) == str(value.value):
             return None
 
+        if value.key in SET_KEYS and _LEGACY_DIGEST.match(str(previous["value"])):
+            # These keys used to be stored as a digest, which could say that
+            # something changed but never what. Re-recording the readable form
+            # is not news.
+            log.info(
+                "watch value format upgraded, not reporting as a change",
+                extra={"subject": subject.name, "key": value.key},
+            )
+            return None
+
         return WatchEvent(
             subject=subject,
             key=value.key,
@@ -235,9 +269,12 @@ class Watcher:
         different thing entirely -- it is what a server restart looks like.
         """
         cfg = self.settings.anomaly
-        fraction, floor = DELTA_RULES.get(
-            value.key, (cfg.delta_alert_fraction, cfg.delta_min_absolute)
+        default = (
+            LOAD_DELTA_RULE
+            if value.key.startswith(DELTA_KEY_PREFIXES)
+            else (cfg.delta_alert_fraction, cfg.delta_min_absolute)
         )
+        fraction, floor = DELTA_RULES.get(value.key, default)
         try:
             current = float(value.value)
         except (TypeError, ValueError):
@@ -265,7 +302,7 @@ class Watcher:
             "change": change,
             "label": value.label,
             "url": value.url,
-            "health": value.key in HEALTH_KEYS,
+            "health": is_health_key(value.key),
         }
 
     # -- rate anomalies ---------------------------------------------------- #
@@ -342,7 +379,7 @@ class Watcher:
                     else:
                         stats.changes += 1
                         events.append(event)
-                elif value.key in DELTA_KEYS:
+                elif is_delta_key(value.key):
                     hit = self.check_delta(subject, value)
                     if hit:
                         delta_hits.append(hit)
