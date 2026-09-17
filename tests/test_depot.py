@@ -11,6 +11,7 @@ from src.providers.steam_depot import (
     SteamDepotProvider,
     describe_branch_change,
     parse_branches,
+    parse_depots,
 )
 from src.subjects import Subject, default_subjects
 from src.watch_telegram import WatchNotifier
@@ -254,3 +255,115 @@ def test_the_watcher_skips_subjects_that_are_not_due(settings, storage):
     stats = watcher.run()
     assert stats.subjects_skipped >= 1
     assert "subjects_skipped=" in stats.as_logline()
+
+
+# --------------------------------------------------------------------------- #
+# per-depot manifests -- how Steam itself knows what to fetch
+# --------------------------------------------------------------------------- #
+
+# trimmed from a real `app_info_print 730` run, 2026-09-17
+DEPOTS_INFO = (
+    '"730"\n{\n'
+    '\t"depots"\n\t{\n'
+    '\t\t"732"\n\t\t{\n'
+    '\t\t\t"config"\n\t\t\t{\n\t\t\t\t"oslist"\t\t"windows"\n\t\t\t}\n'
+    '\t\t\t"manifests"\n\t\t\t{\n'
+    '\t\t\t\t"public"\n\t\t\t\t{\n'
+    '\t\t\t\t\t"gid"\t\t"2849850780169022159"\n'
+    '\t\t\t\t\t"size"\t\t"8"\n'
+    '\t\t\t\t\t"download"\t\t"64"\n'
+    '\t\t\t\t}\n\t\t\t}\n\t\t}\n'
+    '\t\t"2347773"\n\t\t{\n'
+    '\t\t\t"config"\n\t\t\t{\n\t\t\t\t"oslist"\t\t"linux"\n\t\t\t}\n'
+    '\t\t\t"manifests"\n\t\t\t{\n'
+    '\t\t\t\t"public"\n\t\t\t\t{\n'
+    '\t\t\t\t\t"gid"\t\t"8639120305802825922"\n'
+    '\t\t\t\t\t"size"\t\t"9550335930"\n'
+    '\t\t\t\t\t"download"\t\t"4604239936"\n'
+    '\t\t\t\t}\n'
+    '\t\t\t\t"1.41.7.4"\n\t\t\t\t{\n'
+    '\t\t\t\t\t"gid"\t\t"1111111111111111111"\n'
+    '\t\t\t\t\t"download"\t\t"4000000000"\n'
+    '\t\t\t\t}\n\t\t\t}\n\t\t}\n'
+    '\t\t"branches"\n\t\t{\n'
+    '\t\t\t"public"\n\t\t\t{\n\t\t\t\t"buildid"\t\t"25218825"\n\t\t\t}\n'
+    '\t\t}\n\t}\n}\n'
+)
+
+
+def test_depot_manifests_are_parsed_with_platform_and_size():
+    depots = parse_depots(DEPOTS_INFO)
+    assert set(depots) == {"732", "2347773"}
+    assert depots["2347773"]["os"] == "linux"
+    public = depots["2347773"]["manifests"]["public"]
+    assert public["gid"] == "8639120305802825922"
+    assert public["download"] == "4604239936"
+    # non-public branches are captured too
+    assert depots["2347773"]["manifests"]["1.41.7.4"]["gid"] == "1111111111111111111"
+
+
+@pytest.mark.parametrize("text", ["", "nothing", '"depots"', '"depots" {'])
+def test_depot_parsing_survives_unusable_output(text):
+    assert parse_depots(text) == {}
+
+
+def test_launcher_shell_depots_are_not_watched(settings, monkeypatch):
+    """732 downloads 64 bytes. Listing it would add a line to every
+    notification and say nothing."""
+    provider = SteamDepotProvider(settings)
+    monkeypatch.setattr(provider, "steamcmd", "/fake/steamcmd.sh")
+    monkeypatch.setattr(provider, "app_info", lambda appid: DEPOTS_INFO)
+    values = {v.key: v for v in provider.read(cs2())}
+    assert "732" not in values["depot_manifests"].value
+    assert values["depot_manifests"].value.startswith("2347773:linux:8639120305802825922:")
+
+
+def test_manifest_change_names_only_the_depots_that_moved():
+    from src.providers.steam_depot import describe_manifest_change
+
+    old = "2347770:any:AAA:53900780944|2347773:linux:BBB:4604239936"
+    new = "2347770:any:AAA:53900780944|2347773:linux:CCC:4711000000"
+    lines = describe_manifest_change(old, new)
+    assert len(lines) == 1
+    assert "2347773" in lines[0] and "linux" in lines[0]
+    assert "4.7" in lines[0]
+    assert "2347770" not in "".join(lines), "an unchanged depot must not be reprinted"
+
+
+def test_manifest_change_reports_a_new_and_a_withdrawn_depot():
+    from src.providers.steam_depot import describe_manifest_change
+
+    appeared = describe_manifest_change("1:any:AAA:5", "1:any:AAA:5|2:linux:BBB:120000000")
+    assert len(appeared) == 1 and "новый" in appeared[0]
+
+    gone = describe_manifest_change("1:any:AAA:5|2:linux:BBB:5", "1:any:AAA:5")
+    assert len(gone) == 1 and "больше не публикуется" in gone[0]
+
+
+def test_manifest_change_is_empty_when_nothing_moved():
+    from src.providers.steam_depot import describe_manifest_change
+
+    same = "2347770:any:AAA:5|2347773:linux:BBB:6"
+    assert describe_manifest_change(same, same) == []
+
+
+def test_manifest_change_tolerates_malformed_entries():
+    from src.providers.steam_depot import describe_manifest_change
+
+    assert describe_manifest_change("", "") == []
+    assert describe_manifest_change("garbage", "garbage") == []
+    assert describe_manifest_change("1:any", "1:any:AAA:5") == ["депот 1 (any) — новый"]
+    # a stub-sized download prints no size rather than "0.0 GB"
+    assert describe_manifest_change("", "1:any:AAA:64") == ["депот 1 (any) — новый"]
+    assert "МБ" in describe_manifest_change("", "1:any:AAA:26889664")[0]
+    assert "ГБ" in describe_manifest_change("", "1:any:AAA:4604239936")[0]
+
+
+def test_manifests_are_a_change_signal_ranked_with_the_build_id():
+    from src.watch_telegram import KEY_TITLES, PRIORITY
+    from src.watcher import CHANGE_KEYS, SET_KEYS
+
+    assert "depot_manifests" in CHANGE_KEYS
+    assert "depot_manifests" in SET_KEYS
+    assert "depot_manifests" in KEY_TITLES
+    assert PRIORITY["depot_manifests"] <= PRIORITY["depot_public_buildid"]

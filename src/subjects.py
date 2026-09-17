@@ -32,6 +32,7 @@ class SubjectKind:
 LEAD_TIME = {
     "depot_branches": "часы–дни — ветка появляется раньше публичной выкладки",
     "depot_public_buildid": "минуты — билд выложен, до анонса",
+    "depot_manifests": "минуты — контент выложен, до анонса",
     "steampipe_domains": "дни",
     "client_update_hosts": "часы–дни",
     "steampipe_load": "минуты — идёт массовая загрузка",

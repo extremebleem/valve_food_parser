@@ -47,6 +47,10 @@ CANDIDATE_PATHS = (
 _KEY_VALUE = re.compile(r'^"([^"]+)"\s+"([^"]*)"$')
 _SECTION = re.compile(r'^"([^"]+)"$')
 
+#: depots whose download is tiny are launcher shells, not content. Watching them
+#: adds a line to every notification and says nothing.
+MIN_INTERESTING_DOWNLOAD = 1_000_000
+
 
 def find_steamcmd() -> Optional[str]:
     explicit = os.environ.get("STEAMCMD_PATH", "").strip()
@@ -103,6 +107,48 @@ def parse_branches(text: str) -> Dict[str, Dict[str, str]]:
         if pair and current:
             branches[current][pair.group(1)] = pair.group(2)
     return {name: data for name, data in branches.items() if data}
+
+
+def parse_depots(text: str) -> Dict[str, Dict[str, Any]]:
+    """Per-depot manifest ids from app_info_print output.
+
+    This is how Steam itself knows what to fetch: ``app_info`` gives a manifest
+    id per depot per branch, the manifest lists the files and chunks, and the
+    chunks come from the CDN. Watching the manifest id is therefore strictly
+    more informative than the build id -- the build id says something changed,
+    the manifest says *which* depot did, and its download size says how much.
+    """
+    start = text.find('"depots"')
+    if start < 0:
+        return {}
+    end = text.find('"branches"', start)
+    block = text[start : end if end > 0 else len(text)]
+
+    depots: Dict[str, Dict[str, Any]] = {}
+    depot = branch = section = None
+    for raw in block.splitlines():
+        line = raw.strip()
+        indent = len(raw) - len(raw.lstrip("\t"))
+        section_match = _SECTION.match(line)
+        if section_match:
+            name = section_match.group(1)
+            if indent == 2 and name.isdigit():
+                depot, branch, section = name, None, None
+                depots[depot] = {"os": "", "manifests": {}}
+            elif indent == 3:
+                section = name
+            elif indent == 4 and section == "manifests":
+                branch = name
+            continue
+        pair = _KEY_VALUE.match(line)
+        if not pair or not depot:
+            continue
+        key, value = pair.groups()
+        if key == "oslist":
+            depots[depot]["os"] = value
+        elif branch and key in ("gid", "download", "size"):
+            depots[depot]["manifests"].setdefault(branch, {})[key] = value
+    return depots
 
 
 class SteamDepotProvider(WatchProvider):
@@ -190,6 +236,31 @@ class SteamDepotProvider(WatchProvider):
                 )
             )
 
+        # Per-depot manifests: which part of the game actually moved. The
+        # download size comes along so the notification can say how big it is.
+        entries = []
+        for depot, info in sorted(parse_depots(text).items(), key=lambda kv: int(kv[0])):
+            public = info["manifests"].get("public") or {}
+            gid = public.get("gid")
+            if not gid:
+                continue
+            download = public.get("download") or "0"
+            if download.isdigit() and int(download) < MIN_INTERESTING_DOWNLOAD:
+                continue
+            entries.append("{}:{}:{}:{}".format(depot, info["os"] or "any", gid, download))
+        if entries:
+            values.append(
+                WatchValue(
+                    subject_id=subject.id,
+                    key="depot_manifests",
+                    value="|".join(entries),
+                    label="{} депотов с контентом".format(len(entries)),
+                    detail=", ".join(e.split(":")[0] for e in entries[:8]),
+                    url=subject.url,
+                    observed_at=now,
+                )
+            )
+
         # A new pinned version branch usually shows up before the public push,
         # so membership of the set matters, not just the public build.
         names = sorted(branches)
@@ -205,6 +276,57 @@ class SteamDepotProvider(WatchProvider):
             )
         )
         return values
+
+
+def describe_manifest_change(old: str, new: str) -> List[str]:
+    """Which depots moved, with their platform and download size.
+
+    Entries look like ``2347773:linux:8639120305802825922:4604235144``. Only the
+    manifest id is compared: a depot whose id is unchanged did not move, and
+    reprinting it would bury the one that did.
+    """
+
+    def index(text: str) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for part in str(text).split("|"):
+            bits = part.split(":")
+            if len(bits) >= 3:
+                out[bits[0]] = bits
+        return out
+
+    before, after = index(old), index(new)
+    lines: List[str] = []
+    for depot in sorted(set(before) | set(after), key=lambda d: int(d) if d.isdigit() else 0):
+        was, now = before.get(depot), after.get(depot)
+        if was and now and was[2] == now[2]:
+            continue
+        if now is None:
+            lines.append("депот {} больше не публикуется".format(depot))
+            continue
+        platform = now[1]
+        size = _format_size(now[3]) if len(now) > 3 else ""
+        lines.append(
+            "депот {} ({}){}{}".format(
+                depot, platform, "" if was else " — новый", ", закачка " + size if size else ""
+            )
+        )
+    return lines
+
+
+def _format_size(raw: str) -> str:
+    """Download size in the unit that reads naturally, or nothing at all.
+
+    Anything under a megabyte is a launcher stub; printing "0.0 GB" for it is
+    worse than printing nothing.
+    """
+    if not str(raw).isdigit():
+        return ""
+    size = int(raw)
+    if size >= 1_000_000_000:
+        return "{:.1f} ГБ".format(size / 1e9)
+    if size >= 1_000_000:
+        return "{:.0f} МБ".format(size / 1e6)
+    return ""
 
 
 def describe_branch_change(old: str, new: str) -> List[str]:

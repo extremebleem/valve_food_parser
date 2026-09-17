@@ -25,6 +25,7 @@ from .telegram import MessageBuilder, TelegramClient, plural_ru
 log = get_logger(__name__)
 
 KEY_TITLES = {
+    "depot_manifests": "📦 Обновилось содержимое депотов",
     "depot_public_buildid": "📦 Выложен новый билд в депот",
     "depot_branches": "🌿 Изменился состав веток депота",
     "gc_deploy_in_flight": "🚀 Выкатка идёт прямо сейчас",
@@ -49,6 +50,7 @@ PRIORITY = {
     # the depot is the earliest signal there is: the build exists before
     # anyone is told about it
     "depot_branches": -1,
+    "depot_manifests": 0,
     "depot_public_buildid": 0,
     "gc_deploy_in_flight": 0,
     "cs2_scheduler": 1,
@@ -185,7 +187,14 @@ class WatchNotifier:
             lines.append("<code>{} → {}</code>".format(self.esc(event.old_value), self.esc(event.new_value)))
         from .watcher import SET_KEYS
 
-        if event.key in SET_KEYS:
+        if event.key == "depot_manifests":
+            # which part of the game moved, and how big the download is --
+            # a plain set diff would print two opaque manifest ids instead
+            from .providers.steam_depot import describe_manifest_change
+
+            for line in describe_manifest_change(event.old_value, event.new_value)[:10]:
+                lines.append("<code>{}</code>".format(self.esc(line)))
+        elif event.key in SET_KEYS:
             # a set changed: name what appeared and what went away, because
             # "the count went from 15 to 16" is not an answer to "what changed"
             for line in describe_set_change(event.old_value, event.new_value)[:10]:

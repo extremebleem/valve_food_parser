@@ -47,6 +47,7 @@ CHANGE_KEYS = frozenset(
         "cs2_services",
         "depot_public_buildid",
         "depot_branches",
+        "depot_manifests",
         "steampipe_domains",
         "client_update_hosts",
     }
@@ -79,7 +80,9 @@ def is_delta_key(key: str) -> bool:
 
 #: values stored as a sorted "a|b|c" set rather than a scalar; a change in one
 #: is rendered as what appeared and what went away
-SET_KEYS = frozenset({"depot_branches", "sdr_pops", "steampipe_domains", "client_update_hosts"})
+SET_KEYS = frozenset(
+    {"depot_branches", "depot_manifests", "sdr_pops", "steampipe_domains", "client_update_hosts"}
+)
 
 #: Per-key (minimum relative move, minimum absolute value) for DELTA_KEYS. One
 #: global threshold cannot serve both a million-player counter and a
